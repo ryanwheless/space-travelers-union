@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>space travelers union</title>
+<meta name="description" content="space travelers union — a creative-musician collective led by Ryan Wheless, based in Tucson, Arizona.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#ededed;
+    --periwinkle:#97a6e6;
+    --periwinkle-dark:#7d8ed8;
+    --blue:#4a90e2;
+    --ink:#1a1a1a;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0}
+  body{
+    background-color:var(--paper);
+    background-image:url("paper.png");
+    background-repeat:repeat;
+    color:var(--ink);
+    font-family:"Oswald",Arial,sans-serif;
+    min-height:100vh;
+    display:flex;justify-content:center;align-items:flex-start;
+  }
+  .stage{
+    width:100%;max-width:440px;min-height:100vh;
+    display:flex;flex-direction:column;position:relative;padding-bottom:28px;
+  }
+  .deck{position:relative;width:100%}
+  .slide{display:none;width:100%;animation:fade .35s ease}
+  .slide.active{display:block}
+  .slide img.art{display:block;width:100%;height:auto;user-select:none;-webkit-user-drag:none}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+
+  .controls{display:flex;align-items:center;justify-content:center;gap:16px;margin-top:6px}
+  .arrow{background:none;border:none;cursor:pointer;padding:8px;line-height:0;color:var(--blue)}
+  .arrow svg{width:34px;height:34px;display:block}
+  .arrow:active{transform:scale(.9)}
+
+  /* boxed clickable label */
+  .label{
+    font-family:"Oswald",sans-serif;font-weight:500;
+    font-size:24px;letter-spacing:3px;text-transform:uppercase;
+    color:var(--ink);background:transparent;
+    border:2px solid var(--ink);
+    padding:10px 0;width:190px;text-align:center;cursor:pointer;
+    transition:background .15s,color .15s;
+  }
+  .label:hover{background:var(--ink);color:var(--paper)}
+  .label:active{transform:translateY(1px)}
+  .label.hidden{display:none}
+
+  .slide-action{display:flex;justify-content:center;margin-top:20px;min-height:0}
+
+  /* periwinkle pill (Shows / Contact) */
+  .pill{
+    font-family:"Oswald",sans-serif;font-weight:500;letter-spacing:1.5px;
+    text-transform:uppercase;font-size:15px;
+    background:var(--periwinkle);color:#fff;
+    border:none;border-radius:14px;padding:14px 32px;cursor:pointer;
+    text-decoration:none;display:inline-block;
+    box-shadow:0 2px 0 var(--periwinkle-dark);
+  }
+  .pill:active{transform:translateY(1px);box-shadow:0 1px 0 var(--periwinkle-dark)}
+
+  .dots{display:flex;justify-content:center;gap:14px;margin-top:28px}
+  .dot{width:16px;height:16px;border-radius:3px;border:none;cursor:pointer;
+    background:var(--blue);opacity:.35;transition:opacity .2s}
+  .dot.active{opacity:1}
+
+  .overlay{position:fixed;inset:0;background:rgba(237,237,237,.6);
+    display:none;align-items:center;justify-content:center;padding:22px;z-index:50}
+  .overlay.open{display:flex}
+  .modal{
+    background:#fff;border:3px solid var(--periwinkle);border-radius:18px;
+    width:100%;max-width:380px;max-height:84vh;overflow:auto;
+    padding:24px 22px 26px;position:relative;
+    box-shadow:0 8px 30px rgba(0,0,0,.12);
+  }
+  .modal .close{position:absolute;top:14px;right:16px;background:none;border:none;
+    font-size:26px;cursor:pointer;color:var(--ink);font-family:Arial,sans-serif;line-height:1}
+  .modal h2{font-family:"Oswald",sans-serif;font-weight:600;letter-spacing:3px;
+    text-transform:uppercase;margin:4px 0 14px;font-size:22px}
+  .modal .body{font-family:"Oswald",sans-serif;font-weight:300;
+    font-size:15px;line-height:1.6;margin:14px 0 18px;color:#2a2a2a}
+  .modal .body p{margin:0 0 12px}
+  .modal .contact-line{margin:8px 0;font-size:14px;letter-spacing:1px}
+  .modal .contact-line a{color:var(--blue);text-decoration:none}
+  .modal .pill{width:100%;text-align:center;margin-top:6px}
+  .embed-wrap{margin-top:6px}
+</style>
+</head>
+<body>
+  <main class="stage">
+    <div class="deck">
+      <section class="slide active" data-slide="listen">
+        <img class="art" src="listen.png" alt="stu. band playing — Listen">
+      </section>
+      <section class="slide" data-slide="about">
+        <img class="art" src="about.png" alt="stu. drummer — About">
+      </section>
+      <section class="slide" data-slide="shows">
+        <img class="art" src="shows.png" alt="stu. saxophone player — Shows">
+      </section>
+    </div>
+
+    <div class="controls">
+      <button class="arrow" id="prev" aria-label="Previous">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 3 6 12l10 9V3z"/></svg>
+      </button>
+      <button class="label" id="label">Listen</button>
+      <button class="arrow" id="next" aria-label="Next">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 3l10 9-10 9V3z"/></svg>
+      </button>
+    </div>
+
+    <div class="slide-action" id="action"></div>
+    <div class="dots" id="dots"></div>
+  </main>
+
+  <div class="overlay" id="overlay">
+    <div class="modal" role="dialog" aria-modal="true">
+      <button class="close" id="close" aria-label="Close">&times;</button>
+      <div id="modal-content"></div>
+    </div>
+  </div>
+
+<script>
+  var BANDCAMP = '<iframe style="border:0;width:100%;height:120px;" src="https://bandcamp.com/EmbeddedPlayer/track=832428594/size=large/bgcol=ffffff/linkcol=4a90e2/tracklist=false/artwork=small/transparent=true/" seamless><a href="https://spacetravelersunion.bandcamp.com/track/for-what-its-worth-were-happy">For What It&#39;s Worth, We&#39;re Happy by space travelers union</a></iframe>';
+  var EMAIL='ryan@wheless.com', PHONE='928-419-1384',
+      SHOWS_LINK='https://www.instagram.com/spacetravelersunion/';
+
+  var slides=[{key:'listen',label:'Listen'},{key:'about',label:'About'},{key:'shows',label:'Shows'}];
+  var i=0;
+  var deck=document.querySelectorAll('.slide');
+  var labelEl=document.getElementById('label');
+  var actionEl=document.getElementById('action');
+  var dotsEl=document.getElementById('dots');
+  var overlay=document.getElementById('overlay');
+  var modalContent=document.getElementById('modal-content');
+
+  slides.forEach(function(s,idx){
+    var d=document.createElement('button');
+    d.className='dot'+(idx===0?' active':'');
+    d.setAttribute('aria-label',s.label);
+    d.addEventListener('click',function(){go(idx)});
+    dotsEl.appendChild(d);
+  });
+  var dots=dotsEl.querySelectorAll('.dot');
+
+  function render(){
+    deck.forEach(function(el,idx){el.classList.toggle('active',idx===i)});
+    dots.forEach(function(el,idx){el.classList.toggle('active',idx===i)});
+    labelEl.textContent=slides[i].label;
+    actionEl.innerHTML='';
+    if(slides[i].key==='shows'){
+      labelEl.classList.add('hidden');           // drop redundant "Shows" box
+      var a=document.createElement('a');
+      a.className='pill'; a.href=SHOWS_LINK; a.target='_blank'; a.rel='noopener';
+      a.textContent='all shows go here'; actionEl.appendChild(a);
+    } else {
+      labelEl.classList.remove('hidden');
+    }
+  }
+  function go(n){i=(n+slides.length)%slides.length;render();}
+
+  document.getElementById('prev').addEventListener('click',function(){go(i-1)});
+  document.getElementById('next').addEventListener('click',function(){go(i+1)});
+  labelEl.addEventListener('click',function(){
+    var k=slides[i].key;
+    if(k==='listen')openModal('Listen','<div class="embed-wrap">'+BANDCAMP+'</div>');
+    else if(k==='about')openModal('About',aboutHTML());
+  });
+
+  function aboutHTML(){
+    return '<div class="body">'
+      +'<p>Space Travelers Union is a creative musician collective led by multi-instrumentalist and producer Ryan Wheless. Formed in the Arizona desert, the group developed through the meeting of composition, improvisation, and electronic signal. Its lineup shifts from project to project, drawing musicians from across the American Southwest, with the Century Room in Tucson serving as a central home for performances.</p>'
+      +'<p>The project moves fluidly between composition and improvisation, often incorporating electronic textures alongside acoustic instruments. Performances emphasize collective interaction and allow the material to develop in real time, pushing the music into territory that cannot be fully captured in the studio.</p>'
+      +'<p>Space Travelers Union has reached international audiences through airplay on BBC6, Radio France’s FIP, JazzFM, and Gilles Peterson’s WorldwideFM. The project has also received Bandcamp New and Notable recognition and placement on YouTube Music’s Jazz Hotlist.</p>'
+      +'</div>'
+      +'<div class="contact-line">✉ <a href="mailto:'+EMAIL+'">'+EMAIL+'</a></div>'
+      +'<div class="contact-line">☎ <a href="tel:'+PHONE.replace(/[^0-9]/g,'')+'">'+PHONE+'</a></div>'
+      +'<a class="pill" href="mailto:'+EMAIL+'">Contact us</a>';
+  }
+  function openModal(title,html){
+    modalContent.innerHTML=(title?'<h2>'+title+'</h2>':'')+html;
+    overlay.classList.add('open');
+  }
+  function closeModal(){overlay.classList.remove('open');modalContent.innerHTML='';}
+  document.getElementById('close').addEventListener('click',closeModal);
+  overlay.addEventListener('click',function(e){if(e.target===overlay)closeModal();});
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Escape')closeModal();
+    if(e.key==='ArrowLeft')go(i-1);
+    if(e.key==='ArrowRight')go(i+1);
+  });
+  var sx=null,dk=document.querySelector('.deck');
+  dk.addEventListener('touchstart',function(e){sx=e.touches[0].clientX},{passive:true});
+  dk.addEventListener('touchend',function(e){
+    if(sx===null)return;var dx=e.changedTouches[0].clientX-sx;
+    if(dx>40)go(i-1);else if(dx<-40)go(i+1);sx=null;
+  });
+  render();
+</script>
+</body>
+</html>
