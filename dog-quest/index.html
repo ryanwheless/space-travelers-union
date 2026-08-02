@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Wildflower — a pocket RPG</title>
+</head>
+<body>
+<style>
+  :root{
+    --sky:#7FB2DC; --cream:#F5EBD8; --paper:#F1E5CC; --dirt:#C49E6C;
+    --bark:#3E3225; --olive:#55663A; --flower:#FFC93E;
+    --display:'Arial Rounded MT Bold','Trebuchet MS',Verdana,sans-serif;
+    --flavor:Georgia,'Times New Roman',serif;
+  }
+  html,body{height:100%;}
+  body{margin:0;overflow:hidden;background:#7FB2DC;touch-action:none;
+    -webkit-user-select:none;user-select:none;font-family:var(--display);}
+  #game{position:fixed;inset:0;}
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:pointer;}
+
+  /* ---- HUD quest chip ---- */
+  #hud{position:absolute;top:14px;left:14px;pointer-events:none;
+    background:rgba(46,37,26,.82);color:var(--cream);
+    border:2px solid rgba(245,235,216,.35);border-radius:8px;
+    padding:8px 14px 9px;line-height:1.35;max-width:72vw;
+    opacity:0;transition:opacity .4s;}
+  #hud.show{opacity:1;}
+  #hud .q-label{font-size:10px;letter-spacing:.22em;color:var(--flower);
+    text-transform:uppercase;}
+  #hud .q-text{font-size:14px;letter-spacing:.02em;}
+  #hud .q-dist{font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+    color:#cfc3ab;font-variant-numeric:tabular-nums;}
+
+  /* ---- hint ---- */
+  #hint{position:absolute;left:50%;bottom:26%;transform:translateX(-50%);
+    color:var(--cream);background:rgba(46,37,26,.72);border-radius:999px;
+    padding:7px 18px;font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+    pointer-events:none;opacity:0;transition:opacity .5s;white-space:nowrap;}
+  #hint.show{opacity:1;animation:hintpulse 2.2s ease-in-out infinite;}
+  @keyframes hintpulse{50%{opacity:.45;}}
+
+  /* ---- overlays ---- */
+  .overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    padding:20px;background:radial-gradient(ellipse at 50% 60%,rgba(40,31,20,.25),rgba(40,31,20,.62));
+    opacity:1;transition:opacity .45s;}
+  .overlay.hidden{opacity:0;pointer-events:none;}
+  .card{background:var(--paper);color:var(--bark);border:3px solid var(--bark);
+    border-radius:10px;box-shadow:0 10px 0 rgba(40,31,20,.45), 0 24px 60px rgba(20,14,6,.5);
+    max-width:420px;width:min(92vw,420px);padding:30px 30px 26px;text-align:center;}
+  .eyebrow{font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:var(--olive);margin:0 0 10px;}
+  h1{font-family:var(--display);font-size:clamp(38px,9vw,54px);line-height:.95;margin:0 0 4px;
+    letter-spacing:.02em;color:var(--bark);text-wrap:balance;}
+  h1 .fl{color:#c99418;}
+  .sub{font-family:var(--flavor);font-style:italic;font-size:15px;margin:0 0 18px;color:#6d5c44;}
+  .quest-box{border:2px dashed var(--olive);border-radius:8px;background:rgba(85,102,58,.08);
+    padding:12px 16px;margin:0 0 18px;text-align:left;}
+  .quest-box .q-label{font-size:10px;letter-spacing:.24em;text-transform:uppercase;color:var(--olive);margin:0 0 4px;}
+  .quest-box p{font-family:var(--flavor);font-size:15px;line-height:1.5;margin:0;}
+  .controls{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#7c6c52;margin:0 0 20px;line-height:1.9;}
+  kbd{border:1.5px solid var(--bark);border-bottom-width:3px;border-radius:5px;
+    padding:1px 7px;font-family:var(--display);font-size:11px;background:var(--cream);}
+  button{font-family:var(--display);font-size:15px;letter-spacing:.12em;text-transform:uppercase;
+    background:var(--bark);color:var(--cream);border:0;border-radius:8px;
+    padding:14px 30px;cursor:pointer;box-shadow:0 4px 0 #241c11;transition:transform .08s,box-shadow .08s;}
+  button:hover{transform:translateY(-1px);box-shadow:0 5px 0 #241c11;}
+  button:active{transform:translateY(3px);box-shadow:0 1px 0 #241c11;}
+  button:focus-visible{outline:3px solid var(--flower);outline-offset:3px;}
+
+  /* ---- win ---- */
+  #win{background:radial-gradient(ellipse at 50% 45%,rgba(40,31,20,.5),rgba(40,31,20,.82));}
+  #win .card{background:transparent;border:0;box-shadow:none;max-width:520px;width:auto;}
+  .winword{font-family:var(--display);font-weight:bold;font-size:clamp(56px,14vw,110px);
+    line-height:.92;margin:0;color:var(--flower);letter-spacing:.01em;
+    text-shadow:0 3px 0 #8a5a10,0 6px 0 #3E3225,0 14px 30px rgba(20,14,6,.55);
+    transform:rotate(-3deg);animation:winpop .55s cubic-bezier(.2,1.6,.4,1) both;}
+  @keyframes winpop{from{transform:rotate(-3deg) scale(.3);opacity:0;}to{transform:rotate(-3deg) scale(1);opacity:1;}}
+  .sniffs{font-family:var(--flavor);font-style:italic;font-size:clamp(16px,3.4vw,22px);
+    color:var(--cream);margin:18px 0 6px;letter-spacing:.06em;
+    animation:fadeup .6s .35s both;}
+  .windetail{font-family:var(--flavor);font-size:15px;line-height:1.55;color:#e8ddc6;
+    max-width:34ch;margin:0 auto 26px;animation:fadeup .6s .55s both;}
+  #win button{animation:fadeup .6s .8s both;}
+  @keyframes fadeup{from{opacity:0;transform:translateY(12px);}to{opacity:1;transform:none;}}
+
+  @media (prefers-reduced-motion:reduce){
+    #hint.show,.winword,.sniffs,.windetail,#win button{animation:none;}
+  }
+</style>
+
+<div id="game">
+  <canvas id="c"></canvas>
+
+  <div id="hud">
+    <div class="q-label">Quest</div>
+    <div class="q-text">Smell the wildflower</div>
+    <div class="q-dist"><span id="paces">–</span> paces away</div>
+  </div>
+
+  <div id="hint">Hold to trot</div>
+
+  <div id="start" class="overlay">
+    <div class="card">
+      <p class="eyebrow">A pocket RPG · one quest only</p>
+      <h1>WILD<span class="fl">FLOWER</span></h1>
+      <p class="sub">the world, from a small dog's point of view</p>
+      <div class="quest-box">
+        <p class="q-label">Quest log — 1 of 1</p>
+        <p>Somewhere across the dirt field, one yellow wildflower is blooming.
+        Go smell it. That is the entire quest.</p>
+      </div>
+      <p class="controls">Hold <kbd>W</kbd> or <kbd>&uarr;</kbd> to trot<br>
+        (or press &amp; hold anywhere)</p>
+      <button id="beginBtn">Begin the quest</button>
+    </div>
+  </div>
+
+  <div id="win" class="overlay hidden">
+    <div class="card">
+      <p class="winword">YOU&nbsp;WIN!</p>
+      <p class="sniffs">*sniff&hellip; sniff&hellip; snort*</p>
+      <p class="windetail">The wildflower has been thoroughly smelled.
+      The field is at peace. You are a very good dog.</p>
+      <button id="againBtn">Smell it again</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  'use strict';
+  var cvs=document.getElementById('c'), ctx=cvs.getContext('2d');
+  var hud=document.getElementById('hud'), hint=document.getElementById('hint');
+  var startOv=document.getElementById('start'), winOv=document.getElementById('win');
+  var pacesEl=document.getElementById('paces');
+  var reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  var W=0,H=0,DPR=1,horizon=0,focal=0,cx=0;
+  var silCan=null,grainCan=null;
+
+  // ---- world state ----
+  var FLOWER_Z=64, SNIFF_AT=2.35;
+  var state='title';           // title | play | sniff | won
+  var playerZ=0, phase=0, sniffT=0, wonT=0;
+  var held=false, keys={};
+  var last=performance.now();
+
+  // seeded-ish scatter (plain Math.random is fine in-browser)
+  var pebbles=[], weeds=[], clouds=[], scents=[], petals=[];
+  for(var i=0;i<110;i++) pebbles.push({x:(Math.random()*2-1)*46, z:Math.random()*FLOWER_Z,
+    s:.5+Math.random()*1.4, c:Math.random()});
+  for(i=0;i<26;i++) weeds.push({x:(Math.random()*2-1)*40, z:Math.random()*FLOWER_Z,
+    s:.7+Math.random()*.9, lean:Math.random()*2-1});
+  for(i=0;i<6;i++) clouds.push({x:Math.random(), y:.06+Math.random()*.32,
+    s:.6+Math.random()*1.1, v:(4+Math.random()*7)});
+
+  function resize(){
+    DPR=Math.min(window.devicePixelRatio||1,2);
+    W=window.innerWidth; H=window.innerHeight;
+    cvs.width=W*DPR; cvs.height=H*DPR;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    horizon=H*.52; focal=H*.42; cx=W*.5;
+    buildSilhouette(); buildGrain();
+  }
+
+  // ---- treeline silhouette (cached) ----
+  function treeBlob(c,x,y,r,col){
+    c.fillStyle=col; c.beginPath();
+    for(var a=0;a<7;a++){
+      var ang=a/7*Math.PI*2;
+      c.moveTo(x,y);
+      c.arc(x+Math.cos(ang)*r*.55, y+Math.sin(ang)*r*.38, r*.5, 0, Math.PI*2);
+    }
+    c.fill();
+  }
+  function buildSilhouette(){
+    silCan=document.createElement('canvas');
+    silCan.width=Math.ceil(W*DPR); silCan.height=Math.ceil(H*.42*DPR);
+    var c=silCan.getContext('2d'); c.setTransform(DPR,0,0,DPR,0,0);
+    var base=H*.30; // silhouette canvas: baseline near its bottom
+    // hazy back row
+    c.globalAlpha=.65;
+    for(var x=-30;x<W+40;x+=34+Math.random()*30)
+      treeBlob(c,x,base-H*(.025+Math.random()*.045),H*(.030+Math.random()*.028),'#7d8f63');
+    c.globalAlpha=1;
+    // front row
+    for(x=-20;x<W+40;x+=26+Math.random()*26)
+      treeBlob(c,x,base-H*(.012+Math.random()*.038),H*(.026+Math.random()*.030),'#4d5e35');
+    // small dark tree, far left (like the photo)
+    treeBlob(c,W*.03,base-H*.075,H*.055,'#3b4a27');
+    treeBlob(c,W*.015,base-H*.13,H*.045,'#3b4a27');
+    // the big tree on the right
+    var bx=W*.88;
+    treeBlob(c,bx,base-H*.10,H*.075,'#46572f');
+    treeBlob(c,bx-W*.055,base-H*.16,H*.06,'#46572f');
+    treeBlob(c,bx+W*.06,base-H*.17,H*.065,'#3f5029');
+    treeBlob(c,bx+W*.01,base-H*.23,H*.06,'#46572f');
+    treeBlob(c,bx+W*.09,base-H*.09,H*.06,'#4d5e35');
+    // ground contact strip
+    c.fillStyle='#5a6a3e'; c.fillRect(0,base-2,W,H);
+  }
+
+  function buildGrain(){
+    grainCan=document.createElement('canvas');
+    grainCan.width=160; grainCan.height=160;
+    var c=grainCan.getContext('2d'), img=c.createImageData(160,160);
+    for(var i=0;i<img.data.length;i+=4){
+      var v=200+Math.random()*55;
+      img.data[i]=img.data[i+1]=img.data[i+2]=v;
+      img.data[i+3]=Math.random()*26;
+    }
+    c.putImageData(img,0,0);
+  }
+
+  // ---- input ----
+  function down(){ if(state==='play') held=true; }
+  function up(){ held=false; }
+  cvs.addEventListener('pointerdown',function(e){e.preventDefault();down();});
+  window.addEventListener('pointerup',up);
+  window.addEventListener('pointercancel',up);
+  window.addEventListener('blur',function(){keys={};held=false;});
+  window.addEventListener('keydown',function(e){
+    if(e.key==='ArrowUp'||e.key==='w'||e.key==='W'||e.key===' '){
+      if(e.key===' '||e.key==='ArrowUp') e.preventDefault();
+      keys[e.key]=true; down();
+    }});
+  window.addEventListener('keyup',function(e){
+    delete keys[e.key];
+    if(Object.keys(keys).length===0) held=false;
+  });
+
+  document.getElementById('beginBtn').addEventListener('click',function(){
+    state='play'; startOv.classList.add('hidden');
+    hud.classList.add('show'); hint.classList.add('show');
+  });
+  document.getElementById('againBtn').addEventListener('click',function(){
+    playerZ=0; phase=0; sniffT=0; wonT=0; scents.length=0; petals.length=0;
+    state='play'; winOv.classList.add('hidden');
+    hud.classList.add('show'); hint.classList.add('show');
+  });
+
+  // ---- helpers ----
+  function rel(){ return FLOWER_Z-playerZ; }
+  function ease(t){ return t<0?0:t>1?1:t*t*(3-2*t); }
+
+  // ---- render pieces ----
+  function drawSky(t){
+    var g=ctx.createLinearGradient(0,0,0,horizon);
+    g.addColorStop(0,'#5f9ed3'); g.addColorStop(.55,'#9cc4e4');
+    g.addColorStop(.88,'#d9e6ec'); g.addColorStop(1,'#efe7d8');
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,horizon+2);
+    // golden glow, low right (the light in the photo)
+    var rg=ctx.createRadialGradient(W*.82,horizon,0,W*.82,horizon,W*.5);
+    rg.addColorStop(0,'rgba(255,228,170,.28)'); rg.addColorStop(1,'rgba(255,228,170,0)');
+    ctx.fillStyle=rg; ctx.fillRect(0,0,W,horizon+2);
+    // wispy clouds
+    ctx.fillStyle='rgba(255,255,255,.55)';
+    for(var i=0;i<clouds.length;i++){
+      var cl=clouds[i];
+      var x=((cl.x*W + (reduced?0:t*.001*cl.v)) % (W+340))-170;
+      var y=cl.y*horizon;
+      ctx.globalAlpha=.16+.14*cl.s;
+      ctx.beginPath();
+      ctx.ellipse(x,y,90*cl.s,10*cl.s,-.06,0,Math.PI*2);
+      ctx.ellipse(x+60*cl.s,y+7*cl.s,60*cl.s,7*cl.s,.05,0,Math.PI*2);
+      ctx.ellipse(x-55*cl.s,y+9*cl.s,48*cl.s,6*cl.s,-.1,0,Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha=1;
+  }
+
+  function drawTrees(){
+    var grow=1+ease(playerZ/FLOWER_Z)*.14;   // treeline swells slightly as you close in
+    var sh=H*.42, sw=W;
+    ctx.drawImage(silCan, cx-sw*grow/2, horizon-H*.30*grow, sw*grow, sh*grow);
+  }
+
+  function drawGround(){
+    var g=ctx.createLinearGradient(0,horizon,0,H);
+    g.addColorStop(0,'#cdb289'); g.addColorStop(.35,'#c49e6c'); g.addColorStop(1,'#ab8354');
+    ctx.fillStyle=g; ctx.fillRect(0,horizon,W,H-horizon);
+    // scattered dirt + weeds, flowing past with the walk
+    var i,p,r,y,x,s;
+    for(i=0;i<pebbles.length;i++){
+      p=pebbles[i];
+      r=((p.z-playerZ)%FLOWER_Z+FLOWER_Z)%FLOWER_Z;
+      if(r<1.2||r>55) continue;
+      y=horizon+focal/r; if(y>H+20) continue;
+      x=cx+p.x*(focal/r)*.09;
+      s=Math.min((focal/r)*.05*p.s, 26);
+      ctx.fillStyle=p.c<.25?'#d9bd92':(p.c<.7?'#a5825a':'#93714b');
+      ctx.beginPath(); ctx.ellipse(x,y,s,s*.55,0,0,Math.PI*2); ctx.fill();
+    }
+    for(i=0;i<weeds.length;i++){
+      p=weeds[i];
+      r=((p.z-playerZ)%FLOWER_Z+FLOWER_Z)%FLOWER_Z;
+      if(r<1.4||r>45) continue;
+      y=horizon+focal/r; if(y>H+20) continue;
+      x=cx+p.x*(focal/r)*.09;
+      s=Math.min((focal/r)*.14*p.s, 60);
+      ctx.strokeStyle='#6d8b3c'; ctx.lineWidth=Math.max(1,s*.06);
+      ctx.beginPath();
+      ctx.moveTo(x,y); ctx.quadraticCurveTo(x+p.lean*s*.3,y-s*.6,x+p.lean*s*.5,y-s);
+      ctx.moveTo(x,y); ctx.quadraticCurveTo(x-p.lean*s*.2,y-s*.5,x-p.lean*s*.35,y-s*.8);
+      ctx.stroke();
+    }
+  }
+
+  function drawFlower(t){
+    var r=Math.max(rel(),1.55);
+    if(state==='sniff') r=Math.max(1.55, SNIFF_AT-ease(sniffT/1.1)*.8);
+    if(state==='won') r=1.55;
+    if(r>58) return;
+    var scale=focal/r;
+    var y=horizon+scale, x=cx+(-1.5)*scale*.09*3;   // a touch left of center
+    var fs=Math.min(Math.max(scale*.30,4),H*.26);   // flower head radius; never smaller than a speck
+    var sway=reduced?0:Math.sin(t*.0016)*fs*.06;
+    // stem
+    ctx.strokeStyle='#5e7a33'; ctx.lineWidth=Math.max(1.5,fs*.13);
+    ctx.beginPath();
+    ctx.moveTo(x,y);
+    ctx.quadraticCurveTo(x+fs*.3, y-fs*1.1, x+sway, y-fs*2.1);
+    ctx.stroke();
+    // leaves
+    ctx.fillStyle='#6d8b3c';
+    ctx.beginPath(); ctx.ellipse(x+fs*.45,y-fs*.8,fs*.5,fs*.16,-.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x-fs*.4,y-fs*1.2,fs*.42,fs*.14,.6,0,Math.PI*2); ctx.fill();
+    // petals
+    var hx=x+sway, hy=y-fs*2.1;
+    for(var a=0;a<8;a++){
+      var ang=a/8*Math.PI*2 + (reduced?0:t*.0002);
+      ctx.fillStyle=a%2?'#ffc93e':'#ffd968';
+      ctx.beginPath();
+      ctx.ellipse(hx+Math.cos(ang)*fs*.62, hy+Math.sin(ang)*fs*.62, fs*.42, fs*.24, ang, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.fillStyle='#7a4e1f';
+    ctx.beginPath(); ctx.arc(hx,hy,fs*.34,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#5c3a15';
+    for(a=0;a<7;a++){
+      var da=a*2.4, dr=fs*.2*Math.sqrt(a/7);
+      ctx.beginPath(); ctx.arc(hx+Math.cos(da)*dr,hy+Math.sin(da)*dr,fs*.035,0,Math.PI*2); ctx.fill();
+    }
+    return {x:hx,y:hy,fs:fs};
+  }
+
+  function spawnScent(fx,fy){
+    scents.push({x:fx+(Math.random()*2-1)*20, y:fy, t:0, w:6+Math.random()*10,
+      dur:.9+Math.random()*.5});
+  }
+  function drawScents(dt){
+    ctx.strokeStyle='rgba(255,255,255,.0)';
+    for(var i=scents.length-1;i>=0;i--){
+      var s=scents[i]; s.t+=dt;
+      var k=s.t/s.dur;
+      if(k>=1){scents.splice(i,1);continue;}
+      var y=s.y-k*H*.16, alpha=(1-k)*.7;
+      ctx.strokeStyle='rgba(255,255,255,'+alpha.toFixed(3)+')';
+      ctx.lineWidth=2;
+      ctx.beginPath();
+      for(var j=0;j<=10;j++){
+        var yy=y-j*4.5, xx=s.x+Math.sin(j*.9+s.t*6)*s.w*(1-k*.4);
+        j?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy);
+      }
+      ctx.stroke();
+    }
+  }
+
+  function drawSnout(bob,t){
+    var lift=0;
+    if(state==='sniff') lift=ease(sniffT/1.1)*H*.06;
+    if(state==='won') lift=H*.06;
+    var sn=H*.24, baseY=H+ -lift - bob*.55;
+    var wob=(state==='sniff'&&!reduced)?Math.sin(t*.06)*2.5:0;
+    ctx.save();
+    ctx.translate(cx+wob, baseY);
+    // muzzle fur
+    var g=ctx.createLinearGradient(0,-sn,0,0);
+    g.addColorStop(0,'#f5ebd8'); g.addColorStop(1,'#e2d2b2');
+    ctx.fillStyle=g;
+    ctx.beginPath();
+    ctx.moveTo(-W*.34,sn);
+    ctx.bezierCurveTo(-W*.30,-sn*.25, -sn*.62,-sn*.92, 0,-sn*.98);
+    ctx.bezierCurveTo(sn*.62,-sn*.92, W*.30,-sn*.25, W*.34,sn);
+    ctx.closePath(); ctx.fill();
+    // scruffy fur wisps along the top edge
+    ctx.strokeStyle='#efe3c8'; ctx.lineWidth=2; ctx.lineCap='round';
+    for(var i=-8;i<=8;i++){
+      var fx=i*sn*.11, fy=-sn*(.96-Math.abs(i)*.028);
+      var fl=sn*(.10+((i*7919)%5)*.014);
+      ctx.beginPath(); ctx.moveTo(fx,fy);
+      ctx.lineTo(fx+((i%2)?4:-4), fy-fl); ctx.stroke();
+    }
+    // whiskers
+    ctx.strokeStyle='rgba(255,255,255,.5)'; ctx.lineWidth=1.4;
+    ctx.beginPath();
+    ctx.moveTo(-sn*.45,-sn*.42); ctx.quadraticCurveTo(-sn*1.15,-sn*.62,-sn*1.5,-sn*.5);
+    ctx.moveTo(-sn*.45,-sn*.3);  ctx.quadraticCurveTo(-sn*1.1,-sn*.36,-sn*1.45,-sn*.2);
+    ctx.moveTo(sn*.45,-sn*.42);  ctx.quadraticCurveTo(sn*1.15,-sn*.62,sn*1.5,-sn*.5);
+    ctx.moveTo(sn*.45,-sn*.3);   ctx.quadraticCurveTo(sn*1.1,-sn*.36,sn*1.45,-sn*.2);
+    ctx.stroke();
+    // nose
+    var nflare=(state==='sniff'&&!reduced)?1+Math.abs(Math.sin(t*.02))*.10:1;
+    ctx.save(); ctx.translate(0,-sn*.86); ctx.scale(nflare,nflare);
+    ctx.fillStyle='#2e2620';
+    ctx.beginPath();
+    ctx.moveTo(-sn*.30,-sn*.02);
+    ctx.bezierCurveTo(-sn*.32,-sn*.24, sn*.32,-sn*.24, sn*.30,-sn*.02);
+    ctx.bezierCurveTo(sn*.26,sn*.18, -sn*.26,sn*.18, -sn*.30,-sn*.02);
+    ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,.22)';
+    ctx.beginPath(); ctx.ellipse(-sn*.1,-sn*.13,sn*.09,sn*.045,-.4,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#181310';
+    ctx.beginPath(); ctx.ellipse(-sn*.11,sn*.02,sn*.045,sn*.07,.3,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(sn*.11,sn*.02,sn*.045,sn*.07,-.3,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+    ctx.restore();
+  }
+
+  function drawPetals(dt){
+    if(state!=='won') return;
+    if(!reduced && petals.length<26 && Math.random()<.3)
+      petals.push({x:Math.random()*W,y:-20,vy:40+Math.random()*60,
+        vx:(Math.random()*2-1)*30,rot:Math.random()*6,vr:(Math.random()*2-1)*3,
+        s:6+Math.random()*8});
+    for(var i=petals.length-1;i>=0;i--){
+      var p=petals[i];
+      p.y+=p.vy*dt; p.x+=p.vx*dt+Math.sin(p.y*.02)*.6; p.rot+=p.vr*dt;
+      if(p.y>H+30){petals.splice(i,1);continue;}
+      ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.rot);
+      ctx.fillStyle='#ffc93e';
+      ctx.beginPath(); ctx.ellipse(0,0,p.s,p.s*.5,0,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawGrade(t){
+    // warm golden-hour wash
+    var g=ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,'rgba(255,214,150,0)');
+    g.addColorStop(1,'rgba(255,190,120,.10)');
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+    // vignette
+    var v=ctx.createRadialGradient(cx,H*.5,H*.35,cx,H*.5,H*.95);
+    v.addColorStop(0,'rgba(30,22,12,0)'); v.addColorStop(1,'rgba(30,22,12,.28)');
+    ctx.fillStyle=v; ctx.fillRect(0,0,W,H);
+    // film grain (echoes the photo's texture)
+    var ox=reduced?0:(t*.05)%160, oy=reduced?0:(t*.083)%160;
+    ctx.globalAlpha=.5;
+    for(var x=-ox;x<W;x+=160) for(var y=-oy;y<H;y+=160) ctx.drawImage(grainCan,x,y);
+    ctx.globalAlpha=1;
+  }
+
+  // ---- main loop ----
+  function frame(now){
+    var dt=Math.min((now-last)/1000,.05); last=now;
+
+    if(state==='play'&&held){
+      phase+=dt*7.4;
+      playerZ+=dt*9.5;
+      hint.classList.remove('show');
+    }
+    if(state==='play'&&rel()<=SNIFF_AT){
+      state='sniff'; sniffT=0; held=false;
+      hud.classList.remove('show'); hint.classList.remove('show');
+    }
+    if(state==='sniff'){
+      sniffT+=dt;
+      if(sniffT>1.7){ state='won'; wonT=0; winOv.classList.remove('hidden'); }
+    }
+    if(state==='won') wonT+=dt;
+
+    var bobAmp=reduced?H*.004:H*.012;
+    var bob=(held&&state==='play')?Math.sin(phase*2)*bobAmp:0;
+    var sway=(held&&state==='play')?Math.sin(phase)*W*.006:0;
+
+    ctx.clearRect(0,0,W,H);
+    ctx.save();
+    ctx.translate(sway,bob);
+    drawSky(now);
+    drawTrees();
+    drawGround();
+    var f=drawFlower(now);
+    ctx.restore();
+
+    if(f&&(state==='sniff'||state==='won'||rel()<7)){
+      if(!reduced&&Math.random()<(state==='sniff'?.35:.12)) spawnScent(f.x,f.y);
+      drawScents(dt);
+    } else { drawScents(dt); }
+
+    drawSnout(bob,now);
+    drawPetals(dt);
+    drawGrade(now);
+
+    if(state==='play') pacesEl.textContent=Math.max(0,Math.round((rel()-SNIFF_AT)*1.6));
+
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('resize',resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
