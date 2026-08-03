@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Fretboard</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <header class="top">
+    <h1 class="wordmark">fretboard</h1>
+    <button id="keyChip" class="key-chip" type="button" title="Change key &amp; material"></button>
+  </header>
+
+  <main class="board-wrap">
+    <svg id="board" xmlns="http://www.w3.org/2000/svg"></svg>
+  </main>
+
+  <footer class="credit">design by Ryan Wheless</footer>
+
+  <!-- The engine's native controls. Hidden: the sheets and toolbar below
+       drive them, so view.js keeps reading state from the same elements. -->
+  <div class="engine">
+    <select id="root"></select>
+    <select id="kind">
+      <option value="scale">scales</option>
+      <option value="arpeggio">arpeggios</option>
+      <option value="chord">chords</option>
+    </select>
+    <select id="scale"></select>
+    <select id="labels">
+      <option value="none" selected>off</option>
+      <option value="note">notes</option>
+      <option value="degree">degrees</option>
+    </select>
+  </div>
+
+  <div id="hud">
+    <div id="cagedNav" class="pill">
+      <button id="prevPos" type="button" title="Previous shape">&#8249;</button>
+      <span id="posLabel"></span>
+      <button id="nextPos" type="button" title="Next shape">&#8250;</button>
+    </div>
+    <div id="pathNav" class="pill">
+      <span id="pathLabel"></span>
+      <button id="playBtn" type="button" class="play-ic" title="Hear the run">
+        <svg class="ic ic-play" viewBox="0 0 20 20"><path d="M6 4l10 6-10 6z" fill="currentColor"/></svg>
+        <svg class="ic ic-stop" viewBox="0 0 20 20"><rect x="5" y="5" width="10" height="10" rx="1.5" fill="currentColor"/></svg>
+      </button>
+      <span class="bpm">
+        <input id="bpm" type="range" min="40" max="200" step="5" value="80" title="Tempo" />
+        <span id="bpmLabel">80</span>
+      </span>
+      <button id="clearPath" type="button" title="Clear the run">clear</button>
+    </div>
+  </div>
+
+  <nav class="dock">
+    <button id="keyBtn" class="tb solo" type="button" title="Key &amp; material">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 18V5l10-2v13" /><circle cx="6.5" cy="18" r="2.5" /><circle cx="16.5" cy="16" r="2.5" />
+      </svg>
+    </button>
+    <div class="toolbar">
+      <button id="cagedBtn" class="tb" type="button" title="Positions">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">
+          <path d="M12 3l8.5 6.2-3.2 10H6.7L3.5 9.2z" />
+        </svg>
+      </button>
+      <button id="pathBtn" class="tb" type="button" title="Build a run">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M15.5 4.5l4 4L8 20l-5.5 1.5L4 16z" />
+        </svg>
+      </button>
+      <button id="viewBtn" class="tb" type="button" title="View &amp; sound">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <path d="M4 7h16M4 12h16M4 17h16" /><circle cx="9" cy="7" r="2" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="7" cy="17" r="2" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
+      <button id="strumBtn" class="tb chordonly play-ic" type="button" title="Strum this grip">
+        <svg class="ic ic-play" viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z" fill="currentColor"/></svg>
+        <svg class="ic ic-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>
+      </button>
+    </div>
+  </nav>
+
+  <div id="scrim"></div>
+
+  <section class="sheet" id="sheetKey">
+    <header><h2>key &amp; material</h2><button class="close" data-close type="button">&#10005;</button></header>
+    <div class="seg" id="kindSeg"></div>
+    <div class="chips" id="rootGrid"></div>
+    <input id="matSearch" type="search" placeholder="search&hellip;" autocomplete="off" />
+    <div class="mat-list" id="matList"></div>
+  </section>
+
+  <section class="sheet" id="sheetView">
+    <header><h2>view &amp; sound</h2><button class="close" data-close type="button">&#10005;</button></header>
+    <div class="row"><span>labels</span><div class="seg" id="labelSeg"></div></div>
+    <div class="row chord-row" id="ghostField">
+      <span>ghost tones</span><button id="ghostBtn" class="switch" type="button"></button>
+    </div>
+    <div class="row chord-row" id="openField">
+      <span>open strings</span><button id="openBtn" class="switch" type="button"></button>
+    </div>
+    <div class="row chord-row" id="strumField">
+      <span>strum spread</span>
+      <span class="slide"><input id="spread" type="range" min="0" max="100" step="5" value="60" /><span id="spreadLabel"></span></span>
+    </div>
+    <p class="hint">
+      <i class="sw" style="background:var(--root)"></i>root &middot;
+      <i class="sw" style="background:var(--note)"></i>tone &middot;
+      <i class="sw" style="background:var(--ghost)"></i>ghost
+    </p>
+  </section>
+
+  <script type="module" src="view.js"></script>
+  <script type="module" src="chrome.js"></script>
+</body>
+</html>

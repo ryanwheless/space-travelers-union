@@ -1,0 +1,1514 @@
+// ============================================================
+// view.js — SVG RENDERING + CONTROLS  (the only DOM-aware file)
+//
+// Adapted from Guitai by Liam Cashmore (github.com/liamcashmore/Guitai).
+// The model in music.js is untouched; this file redraws it vertically —
+// nut at the top, frets descending, the way a chord chart reads — and
+// wires the same state to the minimal chrome in index.html.
+//
+// The board is drawn once. Note markers persist between renders and are
+// moved rather than rebuilt, so cycling positions slides them along the
+// strings instead of blinking them in and out.
+// ============================================================
+
+import {
+  rootOptions,
+  groupsFor,
+  MAJOR_SCALE,
+  tuning,
+  numFrets,
+  numStrings,
+  chromaticGrid,
+  buildScaleGrid,
+  getPositions,
+  getShapeGrid,
+  supportsCaged,
+  findPathThrough,
+  pitchAt,
+  chordVoicings,
+  hasOpenVoicing,
+  gripFingering,
+} from "./music.js";
+
+import { unlock, playSequence, playChord, strumGap } from "./audio.js";
+
+// ---- Visual config ----------------------------------------
+const markerFrets = [3, 5, 7, 9, 15, 17];   // single inlay dots
+const doubleMarker = 12;
+
+// The extra room on the left is the window handle's lane.
+const PAD_L = 64, PAD_T = 64, PAD_R = 40, PAD_B = 30;
+const HANDLE_X = 8, HANDLE_W = 16;
+const FRET_H = 54, STR_GAP = 48, R = 13; // note-circle radius
+const boardW = PAD_L + (numStrings - 1) * STR_GAP + PAD_R;
+const boardH = PAD_T + numFrets * FRET_H + PAD_B;
+
+const FADE_MS  = 240;   // must match the opacity transition in styles.css
+const SLIDE_MS = 360;   // must match the transform transition in styles.css
+
+/**
+ * The same easing curve the CSS uses, evaluated in JS. The run's line is
+ * a list of points rather than a transform, so CSS can't move it — it has
+ * to be stepped by hand, and it should travel exactly as the notes it
+ * connects do.
+ */
+function cubicBezier(p1x, p1y, p2x, p2y) {
+  const cx = 3 * p1x, bx = 3 * (p2x - p1x) - cx, ax = 1 - cx - bx;
+  const cy = 3 * p1y, by = 3 * (p2y - p1y) - cy, ay = 1 - cy - by;
+  const atX = t => ((ax * t + bx) * t + cx) * t;
+  const atY = t => ((ay * t + by) * t + cy) * t;
+  const slope = t => (3 * ax * t + 2 * bx) * t + cx;
+  return x => {
+    let t = x;
+    for (let i = 0; i < 5; i++) {
+      const d = slope(t);
+      if (Math.abs(d) < 1e-6) break;
+      t -= (atX(t) - x) / d;
+    }
+    return atY(t);
+  };
+}
+const ease = cubicBezier(0.45, 0.03, 0.25, 1);
+
+const SVGNS = "http://www.w3.org/2000/svg";
+function el(tag, attrs) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+
+// y-center of a note at a given fret (0 = open, floats above the nut)
+function fretY(f) {
+  return f === 0 ? PAD_T - 34 : PAD_T + (f - 0.5) * FRET_H;
+}
+// x-center of a string (index 0 = low E, drawn at the LEFT)
+function stringX(i) {
+  return PAD_L + i * STR_GAP;
+}
+
+/**
+ * The span of frets a position actually reaches: from its lowest played
+ * fret to its highest. A box can start on a fret nothing is played on,
+ * and that dead edge shouldn't be drawn. Empty frets *between* the two
+ * ends stay inside the span — the hand still covers them.
+ */
+function playedSpan(grid, box) {
+  let lo = null, hi = null;
+  for (let f = box.lo; f <= box.hi; f++) {
+    let used = false;
+    for (let s = 0; s < numStrings; s++) if (grid[s][f]) { used = true; break; }
+    if (!used) continue;
+    if (lo === null) lo = f;
+    hi = f;
+  }
+  return lo === null ? null : { lo, hi };
+}
+
+// ---- View state -------------------------------------------
+let cagedOn  = false;
+let posIndex = 0;
+
+// The stretch of neck being searched for grips. Chords are always shown
+// one hand-position at a time, so this is simply where that hand is —
+// dragged along the neck by the bar beside it.
+const WINDOW_WIDTH = 5;
+let winLo = 0;
+
+// Ghosts: the chord's other tones, shown in the receded color around the
+// grip so you can see what else was available to reach for.
+let ghostOn = false;
+let ghostCells = new Set();
+
+// Open strings. Off, they belong to the nut: they appear only when the
+// window has reached them, so the familiar shape for each part of the
+// neck comes up first. On, any open chord tone may ring under a grip
+// wherever the hand happens to be.
+let openOn = false;
+
+// Path mode: pick a note to start on, then one to finish on.
+let pathOn     = false;
+let pathFrom   = null;   // { string, fret }
+let pathTo     = null;
+/**
+ * Notes the run is held through, as { string, fret, locked }.
+ *
+ * Sliding a note pins it: the run follows, but the pin gives way once an
+ * end is moved, since it was only ever a way of shaping this particular
+ * run. Clicking a note locks it, and a lock is kept through everything —
+ * move an end and the run is re-routed to keep visiting it, turning back
+ * on itself if that is what it takes.
+ */
+let pathStops  = [];
+let pathResult = null;   // { cells, cost } from findPathThrough
+// Showing a position with PATH on traces the whole shape by default.
+// Clearing puts that aside so notes can be picked by hand instead.
+let skipAutoPath = false;
+
+// Playback. `soundingAt` holds the notes under the ear right now — as
+// positions, so a re-render mid-play puts the highlight back where it
+// was. A run lights one at a time; a strum piles them up.
+let player     = null;
+let playerKind = null;          // "run" | "chord"
+let soundingAt = new Set();     // "string:fret"
+
+// The grip on screen, and the one being strummed, so a strum can be cut
+// short when the chord under it changes.
+let currentBase    = null;   // the grip as computed
+let currentVoicing = null;   // that grip as edited — what is actually shown
+let playingSig = null;
+const voicingSig = v => (v ? v.cells.map(cellId).join("|") : "");
+
+/**
+ * A grip the person has altered by hand, with GHOST on: notes switched off
+ * into the receded background, or receded ones switched on in their place.
+ *
+ * Held as a plain list of cells rather than as a search result, because
+ * the whole point is that nothing is re-searched — the notes that were
+ * not touched stay exactly where they were. The edit belongs to the grip
+ * it was made on and is dropped when a different one comes up.
+ */
+let gripEdit = null;   // { sig, cells: [{ string, fret }] }
+
+// Live SVG layers, built once.
+let noteLayer   = null;
+let pathLayer   = null;
+let chordLayer  = null;
+let windowLayer = null;
+let handleGroup = null;
+let handleBar   = null;
+let highlight   = null;
+let winDrag     = null;   // { grabbedAt } while the handle is held
+
+// The band the handle currently sits over, and — for scales and
+// arpeggios — where each position starts, so dragging can scrub between
+// them. Chords slide a fixed window instead, so they leave this null.
+let activeBand  = null;   // { lo, hi }
+let activeStops = null;   // [fret, ...] one per position
+// key -> { group, circle, label }  for notes currently on screen. The key
+// is `string:rank` — the nth note along that string — not the fret, which
+// is what lets a marker slide to a new fret as positions change instead
+// of being torn down and rebuilt.
+const liveNotes = new Map();
+
+// Which marker is sitting on a given `string:fret` right now. Anything
+// wanting to find a note by where it is on the neck, rather than by which
+// marker it happens to be, goes through here. Rebuilt every render.
+const byPosition = new Map();
+
+const cellId = c => `${c.string}:${c.fret}`;
+
+// ============================================================
+// STATIC BOARD  (drawn a single time)
+// ============================================================
+
+function drawBoard() {
+  const svg = document.getElementById("board");
+  svg.setAttribute("viewBox", `0 0 ${boardW} ${boardH}`);
+  svg.innerHTML = "";
+
+  const leftX = stringX(0);
+  const rightX = stringX(numStrings - 1);
+  const midX = (leftX + rightX) / 2;
+
+  // Inlay markers — tiny, nearly subliminal.
+  markerFrets.forEach(f => {
+    if (f > numFrets) return;
+    svg.appendChild(el("circle", {
+      cx: midX, cy: PAD_T + (f - 0.5) * FRET_H, r: 3.5, fill: "var(--inlay)"
+    }));
+  });
+  [-1, 1].forEach(off => {
+    svg.appendChild(el("circle", {
+      cx: midX + off * STR_GAP, cy: PAD_T + (doubleMarker - 0.5) * FRET_H,
+      r: 3.5, fill: "var(--inlay)"
+    }));
+  });
+
+  // The position highlight lives under the notes and slides with them.
+  highlight = el("rect", {
+    id: "posHighlight", x: leftX - 24, y: 0, width: (rightX - leftX) + 48,
+    height: 0, rx: 10, fill: "var(--line)", opacity: 0
+  });
+  svg.appendChild(highlight);
+
+  // Fret wires (the nut a little heavier) + numbers at the marker frets
+  for (let f = 0; f <= numFrets; f++) {
+    const y = PAD_T + f * FRET_H;
+    svg.appendChild(el("line", {
+      x1: leftX - 8, y1: y, x2: rightX + 8, y2: y,
+      stroke: "var(--line)", "stroke-width": f === 0 ? 3.5 : 1.25,
+      "stroke-linecap": "round", opacity: f === 0 ? 1 : 0.9,
+    }));
+  }
+  [...markerFrets, doubleMarker].forEach(f => {
+    if (f > numFrets) return;
+    const t = el("text", {
+      x: leftX - 24, y: PAD_T + (f - 0.5) * FRET_H + 3.5,
+      "text-anchor": "end", "font-size": 10, fill: "var(--line-soft)"
+    });
+    t.textContent = f;
+    svg.appendChild(t);
+  });
+
+  // Strings — uniform hairlines, as the concept draws them.
+  chromaticGrid.forEach((_, i) => {
+    const x = stringX(i);
+    svg.appendChild(el("line", {
+      x1: x, y1: PAD_T, x2: x, y2: PAD_T + numFrets * FRET_H,
+      stroke: "var(--line)", "stroke-width": 1.25, opacity: 0.9,
+    }));
+    // Sat exactly where the open-note marker goes, so the tuning shows
+    // through when that note is out of the scale and is hidden beneath
+    // the marker when it is in — the notes draw on top of the board.
+    const lbl = el("text", {
+      x, y: fretY(0) + 3.5, "text-anchor": "middle",
+      "font-size": 11, fill: "var(--line-soft)", "font-weight": 600,
+    });
+    lbl.textContent = tuning[i];
+    svg.appendChild(lbl);
+  });
+
+  // Chord furniture: crosses over strings left silent.
+  chordLayer = el("g", { id: "chordLayer" });
+  svg.appendChild(chordLayer);
+
+  // The run's connecting line sits under the note markers.
+  pathLayer = el("g", { id: "pathLayer" });
+  pathLine = el("polyline", {
+    points: "", fill: "none", stroke: "var(--line)", "stroke-width": 2.5,
+    "stroke-linecap": "round", "stroke-linejoin": "round", opacity: 0,
+  });
+  pathLayer.appendChild(pathLine);
+  svg.appendChild(pathLayer);
+
+  noteLayer = el("g", { id: "noteLayer" });
+  svg.appendChild(noteLayer);
+
+  // The window handle rides beside the neck so it stays grabbable. It is
+  // built once and then moved, so it can glide and stretch between
+  // positions rather than being redrawn in a new place each time.
+  windowLayer = el("g", { id: "windowLayer" });
+  handleGroup = el("g", { class: "win-handle" });
+  handleBar = el("rect", {
+    class: "bar", x: HANDLE_X, y: 0, width: HANDLE_W, height: 0,
+    rx: HANDLE_W / 2, fill: "var(--line)", opacity: 0.35,
+  });
+  handleGroup.appendChild(handleBar);
+  // Grip lines sit at a fixed spot near the top, so only the bar's height
+  // has to change as the band grows or shrinks.
+  [24, 30, 36].forEach(y => handleGroup.appendChild(el("line", {
+    x1: HANDLE_X + 4, y1: y, x2: HANDLE_X + HANDLE_W - 4, y2: y,
+    stroke: "var(--bg)", "stroke-width": 1.5, "stroke-linecap": "round", opacity: 0.8,
+  })));
+  handleGroup.addEventListener("pointerdown", e => {
+    if (!activeBand) return;
+    const { y1 } = bandEdges(activeBand.lo, activeBand.hi);
+    winDrag = { grabbedAt: boardPoint(e).y - y1 };
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  windowLayer.appendChild(handleGroup);
+  svg.appendChild(windowLayer);
+
+  // The band can also be dragged from the board itself — anywhere that
+  // isn't a note — so the handle is an affordance, not a requirement.
+  svg.addEventListener("pointerdown", e => {
+    if (winDrag || drag || !activeBand) return;
+    if (e.target.closest?.(".note") || e.target.closest?.(".win-handle")) return;
+    const { y1 } = bandEdges(activeBand.lo, activeBand.hi);
+    winDrag = { grabbedAt: boardPoint(e).y - y1 };
+    e.preventDefault();
+  });
+}
+
+// Where a band from `lo` to `hi` sits in board coordinates.
+function bandEdges(lo, hi) {
+  return {
+    y1: lo === 0 ? PAD_T - 52 : PAD_T + (lo - 1) * FRET_H,
+    y2: PAD_T + Math.min(hi, numFrets) * FRET_H,
+  };
+}
+
+/**
+ * A bar beside the neck, dragged along it to move where you're looking.
+ *
+ * For chords it slides a fixed five-fret window. For scales and arpeggios
+ * it rides the position itself, so it keeps each shape's own height — the
+ * positions are four or five frets tall depending on what they contain,
+ * and the bar reports that rather than flattening it.
+ */
+function renderWindowHandle() {
+  if (!handleGroup) return;
+  if (!activeBand) { handleGroup.style.display = "none"; return; }
+
+  const { lo, hi } = activeBand;
+  const { y1, y2 } = bandEdges(lo, hi);
+  handleGroup.style.display = "";
+  // Slid by transform and stretched by height, both of which CSS can ease,
+  // so the bar travels and resizes instead of reappearing elsewhere.
+  handleGroup.style.transform = `translate(0px, ${y1}px)`;
+  handleBar.setAttribute("height", y2 - y1);
+}
+
+// ============================================================
+// NOTES  (diffed against what is already on screen)
+// ============================================================
+
+function makeNote() {
+  const group  = el("g", { class: "note" });
+  // An invisible disc widens the touch target past the visible circle.
+  const hit    = el("circle", { class: "note-hit", cx: 0, cy: 0, r: 22,
+                                fill: "transparent" });
+  const circle = el("circle", { class: "note-circle", cx: 0, cy: 0, r: R });
+  const label  = el("text", { class: "note-label", x: 0, y: 3.5,
+                              "text-anchor": "middle", "font-weight": 700 });
+  group.appendChild(hit);
+  group.appendChild(circle);
+  group.appendChild(label);
+  return { group, circle, label };
+}
+
+/**
+ * Notes are keyed by string and by their order along that string, so a
+ * position change moves each marker to the next fret on the same string
+ * rather than destroying and recreating it. That is what produces the
+ * slide; markers with no counterpart in the new position fade out.
+ */
+function renderNotes(grid, mode) {
+  const wanted = new Map();
+  grid.forEach((row, s) => {
+    let rank = 0;
+    row.forEach((cell, f) => {
+      if (!cell) return;
+      wanted.set(`${s}:${rank++}`, { cell, x: stringX(s), y: fretY(f), string: s, fret: f });
+    });
+  });
+
+  // How each marker should look while a run is being built.
+  const onPath = new Set(pathResult ? pathResult.cells.map(cellId) : []);
+  const roleOf = (s, f) => {
+    // A chord tone the grip doesn't use recedes, the same way notes off
+    // the run do.
+    if (ghostCells.has(`${s}:${f}`)) return "is-muted";
+    if (!pathOn) return "";
+    const id = `${s}:${f}`;
+    if (pathFrom && cellId(pathFrom) === id) return "is-start";
+    if (pathTo   && cellId(pathTo)   === id) return "is-target";
+    const stop = pathStops.find(s => cellId(s) === id);
+    if (stop) return stop.locked ? "is-locked" : "is-pinned";
+    if (onPath.has(id)) return "is-path";
+    return pathFrom ? "is-muted" : "";
+  };
+
+  byPosition.clear();
+
+  // Retire markers with nowhere to go.
+  for (const [key, rec] of liveNotes) {
+    if (wanted.has(key)) continue;
+    liveNotes.delete(key);
+    rec.group.style.opacity = "0";
+    setTimeout(() => rec.group.remove(), FADE_MS);
+  }
+
+  // Place or move the rest.
+  for (const [key, want] of wanted) {
+    let rec = liveNotes.get(key);
+    const isNew = !rec;
+    if (isNew) {
+      rec = makeNote();
+      rec.group.style.opacity = "0";
+      rec.group.addEventListener("click", () => {
+        if (suppressClick) { suppressClick = false; return; }
+        if (!rec.pos) return;
+        // In chord mode a click edits the grip; elsewhere it builds a run.
+        if (isChordMode()) toggleGripNote(rec.pos);
+        else selectPathNote(rec.pos);
+      });
+      rec.group.addEventListener("pointerdown", e => {
+        if (rec.pos) beginDrag(e, rec.pos);
+      });
+      rec.group.addEventListener("dblclick", () => {
+        if (rec.pos) restartPathAt(rec.pos);
+      });
+      noteLayer.appendChild(rec.group);
+      liveNotes.set(key, rec);
+    }
+    rec.pos = { string: want.string, fret: want.fret };
+    const at = `${want.string}:${want.fret}`;
+    byPosition.set(at, rec);
+    const sounding = soundingAt.has(at) ? " is-sounding" : "";
+    rec.group.setAttribute("class",
+      `note ${roleOf(want.string, want.fret)}${sounding}`.trim());
+    // A brand-new marker is placed without transition so it fades in
+    // where it belongs instead of flying in from the corner.
+    if (isNew) rec.group.style.transition = "none";
+    rec.group.style.transform = `translate(${want.x}px, ${want.y}px)`;
+
+    // With labels off the color system carries all the meaning.
+    const text = mode === "none" ? ""
+               : mode === "degree" ? want.cell.degree : want.cell.name;
+    rec.label.textContent = text;
+    rec.label.setAttribute("font-size", text.length > 2 ? 9 : 11);
+    rec.circle.setAttribute("fill", want.cell.isRoot ? "var(--root)" : "var(--note)");
+    // Dark ink reads on the gold tones; cream reads on the red root.
+    rec.label.setAttribute("fill", want.cell.isRoot ? "var(--cream)" : "var(--ink)");
+
+    if (isNew) {
+      requestAnimationFrame(() => {
+        rec.group.style.transition = "";
+        rec.group.style.opacity = "1";
+      });
+    } else {
+      rec.group.style.opacity = "1";
+    }
+  }
+}
+
+// ============================================================
+// PATH SELECTION
+// ============================================================
+
+// The notes currently on the board, as "string:fret" ids. When a
+// position is showing, this is the shape the run must stay inside.
+let visibleCells = null;
+
+const stopIndex = cell => pathStops.findIndex(s => cellId(s) === cellId(cell));
+
+/**
+ * Work out the run for the notes currently chosen.
+ *
+ * Held notes become stops along the way, ordered by pitch in the
+ * direction of travel. Nothing is discarded for sitting outside the two
+ * ends — a stop beyond them just turns the run around there.
+ *
+ * If a set of stops genuinely can't be joined, one is let go and the
+ * search retried: pins first, then the oldest locks last, so a
+ * deliberate lock outlives an incidental pin.
+ */
+function recomputePath({ force = false } = {}) {
+  // The run is about to change under it, so whatever is sounding is no
+  // longer what's on screen.
+  stopSound();
+  if (!pathFrom || !pathTo) { pathResult = null; return; }
+  const root = document.getElementById("root").value;
+  const type = document.getElementById("scale").value;
+  const bounds = cagedOn ? visibleCells : null;
+
+  // A stop landing on an end is redundant.
+  pathStops = pathStops.filter(s =>
+    cellId(s) !== cellId(pathFrom) && cellId(s) !== cellId(pathTo));
+
+  // If the run on screen already visits every stop and both ends, leave
+  // it exactly as it is. Holding a note the run already passes through
+  // asks for nothing new, and re-solving would reshuffle the rest of it
+  // for no reason — each leg is optimised on its own, so a split can land
+  // on a different route of equal cost.
+  if (!force && pathResult) {
+    const cells = pathResult.cells;
+    const endsHold = cellId(cells[0]) === cellId(pathFrom) &&
+                     cellId(cells[cells.length - 1]) === cellId(pathTo);
+    const stopsHold = pathStops.every(s => cells.some(c => cellId(c) === cellId(s)));
+    if (endsHold && stopsHold) return;
+  }
+
+  const ascending = pitchAt(pathTo) >= pitchAt(pathFrom);
+  const inOrder = () => pathStops.slice().sort((a, b) =>
+    ascending ? pitchAt(a) - pitchAt(b) : pitchAt(b) - pitchAt(a));
+
+  while (true) {
+    const found = findPathThrough(root, type, [pathFrom, ...inOrder(), pathTo], bounds);
+    if (found) { pathResult = found; return; }
+    if (pathStops.length === 0) { pathResult = null; return; }
+    // Give up a pin before a lock.
+    const loosest = pathStops.map((s, i) => [s, i]).filter(([s]) => !s.locked).pop()
+                 ?? pathStops.map((s, i) => [s, i]).pop();
+    pathStops.splice(loosest[1], 1);
+  }
+}
+
+// ---- Dragging any note of the run -------------------------
+let drag = null;           // { role: "from" | "to" | "via", moved }
+let suppressClick = false;
+
+// Turn a pointer event into a coordinate inside the board.
+function boardPoint(evt) {
+  const svg = document.getElementById("board");
+  const pt = svg.createSVGPoint();
+  pt.x = evt.clientX;
+  pt.y = evt.clientY;
+  return pt.matrixTransform(svg.getScreenCTM().inverse());
+}
+
+// The scale note nearest the pointer, anywhere on the board. Snapping to
+// notes rather than to coordinates means a dragged note only ever lands
+// somewhere the scale actually goes.
+function cellNearest(x, y) {
+  let best = null, bestGap = Infinity;
+  for (let s = 0; s < numStrings; s++) {
+    for (let f = 0; f <= numFrets; f++) {
+      if (!visibleCells || !visibleCells.has(`${s}:${f}`)) continue;
+      const dx = stringX(s) - x, dy = fretY(f) - y;
+      const gap = dx * dx + dy * dy;
+      if (gap < bestGap) { bestGap = gap; best = { string: s, fret: f }; }
+    }
+  }
+  return best;
+}
+
+// The nearest scale note along one string, for drags that stay on it.
+function cellNearestOnString(string, y) {
+  let best = null, bestGap = Infinity;
+  for (let f = 0; f <= numFrets; f++) {
+    if (!visibleCells || !visibleCells.has(`${string}:${f}`)) continue;
+    const gap = Math.abs(fretY(f) - y);
+    if (gap < bestGap) { bestGap = gap; best = { string, fret: f }; }
+  }
+  return best;
+}
+
+/**
+ * What can be dragged, and how, differs by role on purpose.
+ *
+ * The two ends set how far the run reaches, so they move freely across
+ * the whole board. A locked note only decides which string one note is
+ * played on, so it keeps to its own string — easier to steer, and the
+ * notes on either side redistribute around it. Unlocked notes don't drag
+ * at all; click one first to hold it.
+ */
+function beginDrag(evt, cell) {
+  if (!pathOn || !pathFrom) return;
+  const id = cellId(cell);
+
+  let role = null;
+  if (pathFrom && cellId(pathFrom) === id) role = "from";
+  else if (pathTo && cellId(pathTo) === id) role = "to";
+  else if (stopIndex(cell) >= 0) role = "via";
+  else if (pathResult && pathResult.cells.some(c => cellId(c) === id)) role = "via";
+  if (!role) return;
+
+  drag = { role, string: cell.string, moved: false, held: null };
+  if (role === "via") {
+    // Sliding a note holds it. An existing stop keeps whatever standing
+    // it had; a note taken straight off the run becomes a pin.
+    const at = stopIndex(cell);
+    drag.held = at >= 0 ? pathStops[at] : { ...cell, locked: false };
+    if (at < 0) pathStops.push(drag.held);
+  }
+  evt.preventDefault();
+}
+
+function onDragMove(evt) {
+  // The handle slides along the neck. For chords that moves a fixed
+  // window; for scales and arpeggios it steps to whichever position
+  // starts nearest, so each shape keeps its own height.
+  if (winDrag) {
+    const y = boardPoint(evt).y - winDrag.grabbedAt;
+    const fret = Math.round((y - PAD_T) / FRET_H) + 1;
+
+    if (activeStops) {
+      let nearest = 0;
+      for (let i = 1; i < activeStops.length; i++) {
+        if (Math.abs(activeStops[i] - fret) < Math.abs(activeStops[nearest] - fret)) nearest = i;
+      }
+      if (nearest !== posIndex) {
+        posIndex = nearest;
+        clearPath();
+        render({ animate: false });
+      }
+    } else {
+      const lo = Math.max(0, Math.min(numFrets - WINDOW_WIDTH + 1, fret));
+      if (lo !== winLo) {
+        winLo = lo;
+        posIndex = 0;
+        render({ animate: false });
+      }
+    }
+    return;
+  }
+  if (!drag) return;
+  const p = boardPoint(evt);
+  // Ends roam the board; a waypoint slides along the string it sits on.
+  const cell = drag.role === "via"
+    ? cellNearestOnString(drag.string, p.y)
+    : cellNearest(p.x, p.y);
+  if (!cell) return;
+
+  const current = drag.role === "from" ? pathFrom
+                : drag.role === "to"   ? pathTo
+                : drag.held;
+  if (current && cellId(current) === cellId(cell)) return;   // still on it
+
+  if (drag.role === "via") {
+    const pitch = pitchAt(cell);
+    // A stop must stay between the ends while it's only a pin; a lock is
+    // free to go anywhere, and the run turns around to reach it.
+    if (!drag.held.locked) {
+      const lo = Math.min(pitchAt(pathFrom), pitchAt(pathTo));
+      const hi = Math.max(pitchAt(pathFrom), pitchAt(pathTo));
+      if (pitch <= lo || pitch >= hi) return;
+    }
+    // One stop per pitch: two would contradict each other.
+    pathStops = pathStops.filter(s => s === drag.held || pitchAt(s) !== pitch);
+    drag.held.string = cell.string;
+    drag.held.fret   = cell.fret;
+  } else {
+    // Moving an end releases the pins, which existed only to shape the
+    // run as it was. Locks are kept and the run re-routed to reach them.
+    pathStops = pathStops.filter(s => s.locked);
+    if (drag.role === "from") pathFrom = cell; else pathTo = cell;
+  }
+
+  drag.moved = true;
+  skipAutoPath = true;
+  recomputePath();
+  render({ animate: false });                   // follow the pointer exactly
+}
+
+function endDrag() {
+  if (winDrag) { winDrag = null; return; }
+  if (!drag) return;
+  const moved = drag.moved;
+  drag = null;
+  // A drag that actually moved shouldn't also register as a click.
+  if (moved) suppressClick = true;
+}
+
+/**
+ * Clicking a note along the run locks it where it stands; clicking it
+ * again lets it go. Locking is deliberate, so nothing gets pinned by
+ * accident — and a locked note can then be dragged along its string to
+ * place it, with the rest of the run rearranging around it.
+ *
+ * The ends stay put once placed; drag them to move them. Double-click
+ * anywhere starts over.
+ */
+function selectPathNote(cell) {
+  if (!pathOn) return;
+  // A receded note isn't part of the shape on screen — a run can't use it.
+  if (visibleCells && !visibleCells.has(cellId(cell))) return;
+  const id = cellId(cell);
+
+  const at = stopIndex(cell);
+  if (at >= 0) {
+    if (pathStops[at].locked) {
+      pathStops.splice(at, 1);            // locked -> let it go entirely
+      recomputePath({ force: true });     // freedom returns, so re-solve
+    } else {
+      pathStops[at].locked = true;        // pinned -> make it stick
+    }
+    render();
+    return;
+  }
+  // Placed ends are fixed; only dragging moves them.
+  if (pathFrom && cellId(pathFrom) === id) return;
+  if (pathTo   && cellId(pathTo)   === id) return;
+
+  // A note the run passes through -> lock it right here.
+  if (pathResult && pathResult.cells.some(c => cellId(c) === id)) {
+    pathStops.push({ ...cell, locked: true });
+    recomputePath();
+    render();
+    return;
+  }
+
+  if (!pathFrom) {
+    pathFrom = cell;
+    skipAutoPath = true;                  // a pick of your own takes over
+  } else if (!pathTo) {
+    pathTo = cell;
+    recomputePath();
+  } else {
+    return;                               // run is complete; leave it be
+  }
+  render();
+}
+
+/** Double-click anywhere: drop the run and begin again from that note. */
+function restartPathAt(cell) {
+  if (!pathOn) return;
+  if (visibleCells && !visibleCells.has(cellId(cell))) return;
+  clearPath();
+  pathFrom = cell;
+  skipAutoPath = true;
+  render();
+}
+
+function clearPath() {
+  stopSound();
+  pathFrom = null; pathTo = null; pathStops = []; pathResult = null;
+  skipAutoPath = false;
+}
+
+/**
+ * With a position on screen, PATH starts by tracing the whole shape —
+ * its lowest note up to its highest — since that is the run the position
+ * exists to teach. Clicking any note replaces it with a run of your own.
+ */
+function autoPathForPosition(grid) {
+  let lowest = null, highest = null;
+  grid.forEach((row, s) => row.forEach((cell, f) => {
+    if (!cell) return;
+    const here = { string: s, fret: f, midi: cell.midi };
+    if (!lowest  || here.midi < lowest.midi)  lowest  = here;
+    if (!highest || here.midi > highest.midi) highest = here;
+  }));
+  if (!lowest || !highest || lowest.midi === highest.midi) return;
+
+  pathFrom = { string: lowest.string,  fret: lowest.fret };
+  pathTo   = { string: highest.string, fret: highest.fret };
+  pathStops = [];
+  recomputePath();
+}
+
+// ---- The run's line ---------------------------------------
+const LINE_OPACITY = 0.55;
+
+let pathLine    = null;   // the <polyline>
+let linePoints  = [];     // where it is drawn at this instant
+let lineAnim    = null;   // in-flight animation handle
+let lineShown   = false;  // is it currently visible?
+
+const asPoints = pts => pts.map(p => `${p.x},${p.y}`).join(" ");
+
+// Someone who has asked for less movement gets none of this.
+const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+const wantsMotion = () => !reducedMotion?.matches;
+
+/**
+ * How far along the line each corner sits, as a fraction of its total
+ * length. This is what lets two runs of different lengths be blended:
+ * they are matched by distance travelled, not by note number.
+ */
+function arcFractions(points) {
+  const at = [0];
+  for (let i = 1; i < points.length; i++) {
+    at.push(at[i - 1] + Math.hypot(points[i].x - points[i - 1].x,
+                                   points[i].y - points[i - 1].y));
+  }
+  const total = at[at.length - 1];
+  return { fracs: total === 0 ? at.map(() => 0) : at.map(v => v / total), total };
+}
+
+/** The point a given fraction of the way along a line. */
+function pointAtFraction(points, fracs, t) {
+  if (points.length === 1) return { ...points[0] };
+  let i = 1;
+  while (i < fracs.length - 1 && fracs[i] < t) i++;
+  const span = fracs[i] - fracs[i - 1];
+  const k = span === 0 ? 0 : (t - fracs[i - 1]) / span;
+  const a = points[i - 1], b = points[i];
+  return { x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k };
+}
+
+// Fallback for degenerate lines: hold the last point.
+function padTo(points, length) {
+  if (points.length >= length) return points.slice(0, length);
+  const last = points[points.length - 1];
+  return points.concat(Array.from({ length: length - points.length }, () => ({ ...last })));
+}
+
+/**
+ * Re-cut both lines at the same set of distances along their length.
+ * Every corner of both survives — the points added to each sit flat on a
+ * segment, so neither shape changes — but the two lists now correspond
+ * point for point and can be blended.
+ */
+function alignLines(a, b) {
+  const A = arcFractions(a), B = arcFractions(b);
+  if (A.total === 0 || B.total === 0) {
+    const span = Math.max(a.length, b.length);
+    return [padTo(a, span), padTo(b, span)];
+  }
+  const ts = [...new Set([...A.fracs, ...B.fracs])].sort((x, y) => x - y);
+  return [ts.map(t => pointAtFraction(a, A.fracs, t)),
+          ts.map(t => pointAtFraction(b, B.fracs, t))];
+}
+
+/**
+ * Draw the line joining the run, in playing order.
+ *
+ * Between positions it slides on the same curve and over the same time as
+ * the notes it connects, so the two read as one movement. Appearing and
+ * disappearing is left to a CSS opacity fade — a run arriving somewhere
+ * new shouldn't skate across the neck to get there.
+ *
+ * While a note is being dragged the line tracks the pointer outright,
+ * since easing there would only lag behind the hand.
+ */
+function renderPathLine({ animate = true } = {}) {
+  if (lineAnim) { cancelAnimationFrame(lineAnim); lineAnim = null; }
+
+  const target = (pathOn && pathResult)
+    ? pathResult.cells.map(c => ({ x: stringX(c.string), y: fretY(c.fret) }))
+    : [];
+
+  // No run to show: fade out. The shape is left in place underneath so
+  // nothing flickers through the fade.
+  if (target.length === 0) {
+    pathLine.setAttribute("opacity", 0);
+    lineShown = false;
+    return;
+  }
+
+  // Arriving from hidden, or sliding not wanted: place it outright and
+  // let opacity carry it in.
+  if (!animate || !lineShown || linePoints.length === 0 || !wantsMotion()) {
+    linePoints = target;
+    pathLine.setAttribute("points", asPoints(target));
+    pathLine.setAttribute("opacity", LINE_OPACITY);
+    lineShown = true;
+    return;
+  }
+
+  const [start, end] = alignLines(linePoints, target);
+  const t0 = performance.now();
+
+  const step = now => {
+    const k = Math.min(1, (now - t0) / SLIDE_MS);
+    const e = ease(k);
+    const at = start.map((p, i) => ({
+      x: p.x + (end[i].x - p.x) * e,
+      y: p.y + (end[i].y - p.y) * e,
+    }));
+    linePoints = at;
+    pathLine.setAttribute("points", asPoints(at));
+    if (k < 1) lineAnim = requestAnimationFrame(step);
+    else {
+      lineAnim = null;
+      linePoints = target;
+      pathLine.setAttribute("points", asPoints(target));
+    }
+  };
+  lineAnim = requestAnimationFrame(step);
+}
+
+// ---- Hearing it -------------------------------------------
+
+/**
+ * Light exactly the notes being heard, and let the rest go dark.
+ */
+function showSounding(next) {
+  for (const at of soundingAt) {
+    if (!next.has(at)) byPosition.get(at)?.group.classList.remove("is-sounding");
+  }
+  for (const at of next) {
+    if (!soundingAt.has(at)) byPosition.get(at)?.group.classList.add("is-sounding");
+  }
+  soundingAt = next;
+}
+
+/** Stop whatever is playing, whichever kind it was. */
+function stopSound() {
+  const p = player;
+  player = null;
+  playerKind = null;
+  playingSig = null;
+  p?.stop();
+  showSounding(new Set());
+  syncPlayButton();
+  syncStrumButton();
+}
+
+/**
+ * Play the run as it stands, start to target.
+ */
+async function playRun() {
+  if (!pathResult || pathResult.cells.length < 2) return;
+  // Has to happen inside the click that called this, or the browser
+  // leaves the context suspended and nothing sounds.
+  if (!(await unlock())) return;
+
+  const bpm = Number(document.getElementById("bpm")?.value) || 80;
+  const notes = pathResult.cells.map(c => ({
+    midi: c.midi ?? pitchAt(c),
+    string: c.string,
+    key: cellId(c),
+  }));
+
+  player = playSequence(notes, {
+    bpm,
+    onNote: n => showSounding(n ? new Set([n.key]) : new Set()),
+    onEnd: () => { player = null; playerKind = null; syncPlayButton(); },
+  });
+  playerKind = "run";
+  syncPlayButton();
+}
+
+function syncPlayButton() {
+  const btn = document.getElementById("playBtn");
+  if (!btn) return;
+  const on = playerKind === "run";
+  const can = !!pathResult && pathResult.cells.length > 1;
+  btn.disabled = !can;
+  btn.classList.toggle("active", on);
+  btn.title = !can ? "Build a run first"
+            : on ? "Stop"
+            : "Hear the run, start to target";
+}
+
+/**
+ * Strum the grip on screen, low string to high.
+ */
+async function strumChord() {
+  const v = currentVoicing;
+  if (!v || !v.cells.length) return;
+  if (!(await unlock())) return;
+
+  const t = Number(document.getElementById("spread")?.value ?? 60) / 100;
+  const notes = v.cells.slice()
+    .sort((a, b) => a.string - b.string)     // string 0 is the low E
+    .map(c => ({ midi: pitchAt(c), string: c.string, key: cellId(c) }));
+
+  // The strum builds up rather than moving along, so the lit notes
+  // accumulate and clear together at the end.
+  const lit = new Set();
+  player = playChord(notes, {
+    gap: strumGap(t),
+    onStrike: n => { lit.add(n.key); showSounding(new Set(lit)); },
+    onEnd: () => {
+      player = null; playerKind = null; playingSig = null;
+      showSounding(new Set());
+      syncStrumButton();
+    },
+  });
+  playerKind = "chord";
+  playingSig = voicingSig(v);
+  syncStrumButton();
+}
+
+function syncStrumButton() {
+  const btn = document.getElementById("strumBtn");
+  if (!btn) return;
+  const on = playerKind === "chord";
+  const can = !!currentVoicing && isChordMode();
+  btn.disabled = !can;
+  btn.classList.toggle("active", on);
+  btn.title = !can ? "No grip to play" : on ? "Stop" : "Strum this grip";
+}
+
+// ============================================================
+// CHORDS
+// ============================================================
+
+const isChordMode = () => document.getElementById("kind").value === "chord";
+
+/**
+ * The grip as it should be shown: the computed one, unless it has been
+ * edited by hand, in which case everything about it — its degrees, its
+ * fingering, which strings fall silent — is worked out again from the
+ * notes that are actually held.
+ */
+function effectiveVoicing(root, type, voicing) {
+  if (!voicing) return null;
+  if (!gripEdit || gripEdit.sig !== voicingSig(voicing)) return voicing;
+
+  const cells = gripEdit.cells;
+  if (!cells.length) return voicing;
+
+  const full  = buildScaleGrid(root, type);
+  const notes = cells.map(c => full[c.string][c.fret]);
+  const stopped = cells.map(c => c.fret).filter(f => f > 0);
+  const lo = stopped.length ? Math.min(...stopped) : 0;
+  const hi = stopped.length ? Math.max(...stopped) : 0;
+  const span = stopped.length ? hi - lo + 1 : 0;
+  const grip = gripFingering(cells);
+  const lowest = cells.reduce((low, c) => pitchAt(c) < pitchAt(low) ? c : low, cells[0]);
+
+  return {
+    ...voicing,
+    cells, notes, lo, hi, span,
+    strings: cells.map(c => c.string),   // gaps here become muted strings
+    stretch: span > 4,
+    fingers: grip?.fingers,
+    barre: grip?.barre,
+    fingerable: !!grip,
+    order: notes.map(n => n.degree).join("-"),
+    bass: full[lowest.string][lowest.fret].degree,
+    edited: true,
+  };
+}
+
+/**
+ * Switch a note in or out of the grip.
+ *
+ * A note that is sounding goes quiet, and its string with it. A receded
+ * one starts sounding, and whatever was on that string steps back — a
+ * string can only hold one note.
+ */
+function toggleGripNote(pos) {
+  if (!ghostOn || !isChordMode() || !currentBase || !currentVoicing) return;
+
+  const id = cellId(pos);
+  const cells = currentVoicing.cells.map(c => ({ string: c.string, fret: c.fret }));
+  const at = cells.findIndex(c => cellId(c) === id);
+
+  if (at >= 0) {
+    if (cells.length <= 1) return;          // something has to sound
+    cells.splice(at, 1);
+  } else {
+    const onString = cells.findIndex(c => c.string === pos.string);
+    if (onString >= 0) cells.splice(onString, 1);
+    cells.push({ string: pos.string, fret: pos.fret });
+    cells.sort((a, b) => a.string - b.string);
+  }
+
+  gripEdit = { sig: voicingSig(currentBase), cells };
+  render();
+}
+
+/**
+ * The grips for a chord, worked out once and kept.
+ */
+let voicingCache = { key: null, list: null };
+function voicingsFor(root, type, openAnywhere) {
+  const key = `${root}|${type}|${openAnywhere}`;
+  if (voicingCache.key !== key) {
+    voicingCache = { key, list: chordVoicings(root, type, { stacked: false, openAnywhere }) };
+  }
+  return voicingCache.list;
+}
+
+/**
+ * Reduce the grid to the notes a grip actually holds, and draw the
+ * furniture that only chords need: a cross above every string left silent.
+ */
+function renderChord(root, type, voicing, ghostRange) {
+  const full = buildScaleGrid(root, type);
+  const grid = full.map(row => row.map(() => null));
+
+  // Ghosts first: every chord tone in reach, receded. The grip is then
+  // laid over the top, so its own notes read normally.
+  ghostCells = new Set();
+  if (ghostRange) {
+    const frets = ghostRange.open ? [0] : [];
+    for (let f = Math.max(ghostRange.lo, 1); f <= ghostRange.hi; f++) frets.push(f);
+    if (ghostRange.lo === 0 && !ghostRange.open) frets.unshift(0);
+    for (let s = 0; s < numStrings; s++) {
+      for (const f of frets) {
+        if (!full[s][f]) continue;
+        grid[s][f] = full[s][f];
+        ghostCells.add(`${s}:${f}`);
+      }
+    }
+  }
+  for (const { string, fret } of voicing.cells) {
+    grid[string][fret] = full[string][fret];
+    ghostCells.delete(`${string}:${fret}`);
+  }
+
+  chordLayer.innerHTML = "";
+
+  // Strings the grip leaves out, crossed through above the nut.
+  for (let s = 0; s < numStrings; s++) {
+    if (voicing.strings.includes(s)) continue;
+    const x = stringX(s), y = fretY(0), r = 4.5;
+    [1, -1].forEach(dir => {
+      chordLayer.appendChild(el("line", {
+        x1: x - r, y1: y - r * dir, x2: x + r, y2: y + r * dir,
+        stroke: "var(--line-soft)", "stroke-width": 2, "stroke-linecap": "round",
+      }));
+    });
+  }
+  return grid;
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+
+function render({ animate = true } = {}) {
+  const root = document.getElementById("root").value;
+  const type = document.getElementById("scale").value;
+  const mode = document.getElementById("labels").value;
+
+  // Chords take their own route: a grip is a set of notes held at once,
+  // not a shape to run through, so positions cycle voicings instead.
+  if (isChordMode()) {
+    const winHi = winLo + WINDOW_WIDTH - 1;
+    let voicings = voicingsFor(root, type, openOn);
+    {
+      voicings = voicings
+        .filter(v => v.cells.every(c =>
+          (openOn && c.fret === 0) || (c.fret >= winLo && c.fret <= winHi)))
+        .sort((a, b) =>
+          (a.bass === "1" ? 0 : 1) - (b.bass === "1" ? 0 : 1) ||
+          a.lo - b.lo ||
+          b.cells.length - a.cells.length ||
+          a.fingers - b.fingers);
+    }
+
+    let grid = buildScaleGrid(root, type);
+    let voicing = null;
+    if (voicings.length) {
+      posIndex = Math.max(0, Math.min(posIndex, voicings.length - 1));
+      voicing = voicings[posIndex];
+      if (gripEdit && gripEdit.sig !== voicingSig(voicing)) gripEdit = null;
+      voicing = effectiveVoicing(root, type, voicing) ?? voicing;
+      const ghostRange = ghostOn
+        ? { lo: winLo, hi: Math.min(winHi, numFrets), open: openOn }
+        : null;
+      grid = renderChord(root, type, voicing, ghostRange);
+    } else {
+      chordLayer.innerHTML = "";
+      ghostCells = new Set();
+    }
+    currentBase = voicings.length ? voicings[posIndex] : null;
+    currentVoicing = voicing;
+    if (playerKind === "chord" && voicingSig(voicing) !== playingSig) stopSound();
+    syncStrumButton();
+
+    // Show the stretch being searched, the same band the positions use.
+    activeStops = null;                    // chords slide a window instead
+    activeBand = { lo: winLo, hi: Math.min(winHi, numFrets) };
+    {
+      const { y1, y2 } = bandEdges(activeBand.lo, activeBand.hi);
+      highlight.setAttribute("y", y1);
+      highlight.setAttribute("height", y2 - y1);
+      highlight.setAttribute("opacity", 0.07);
+    }
+    renderWindowHandle();
+    renderNotes(grid, mode);
+    renderPathLine({ animate: false });
+
+    const posLabel = document.getElementById("posLabel");
+    if (posLabel) {
+      if (!voicing) {
+        posLabel.textContent = `no grip fits frets ${winLo}–${winHi}`;
+        posLabel.classList.remove("unplayable");
+      } else {
+        const set = `strings ${numStrings - voicing.strings[0]}–${numStrings - voicing.strings.at(-1)}`;
+        const frets = voicing.lo === voicing.hi
+          ? `fret ${voicing.lo}` : `frets ${voicing.lo}–${voicing.hi}`;
+        const hand = voicing.fingers !== undefined
+          ? ` · ${voicing.fingers} finger${voicing.fingers === 1 ? "" : "s"}` +
+            (voicing.barre ? " + barre" : "")
+          : voicing.edited ? " · more than 4 fingers" : "";
+        posLabel.classList.toggle("unplayable",
+          !!(voicing.edited && voicing.fingerable === false));
+        const inv = voicing.edited ? " · edited"
+          : voicing.label && voicing.label !== "root position" ? ` · ${voicing.label}` : "";
+        posLabel.textContent =
+          `${posIndex + 1}/${voicings.length} · ${set}${inv} · ${voicing.order} · ${frets}` +
+          hand + (voicing.stretch ? " · stretch" : "");
+      }
+    }
+    const prevB = document.getElementById("prevPos");
+    const nextB = document.getElementById("nextPos");
+    if (prevB && nextB) {
+      prevB.disabled = posIndex === 0;
+      nextB.disabled = posIndex >= voicings.length - 1;
+    }
+    return;
+  }
+  chordLayer.innerHTML = "";
+  ghostCells = new Set();
+
+  // 1) Build the scale's own grid.
+  let grid = buildScaleGrid(root, type);
+
+  // 2) If position mode is active, work out the current box. The whole
+  //    scale stays on the board — the shape's notes keep their colors and
+  //    everything outside it recedes to the ghost color, so the position
+  //    reads against the neck around it rather than floating alone.
+  let box = null, boxCount = 0, shapeGrid = null;
+  activeStops = null;
+  if (cagedOn) {
+    const found = getPositions(root, type);
+    boxCount = found.boxes.length;
+    activeStops = found.boxes.map(b => {
+      const trimmed = playedSpan(getShapeGrid(root, type, b), b);
+      return trimmed ? trimmed.lo : b.lo;
+    });
+    if (boxCount > 0) {
+      posIndex = Math.max(0, Math.min(posIndex, boxCount - 1));
+      box = found.boxes[posIndex];
+      shapeGrid = getShapeGrid(root, type, box);
+    }
+  }
+  if (shapeGrid) {
+    grid.forEach((row, s) => row.forEach((cell, f) => {
+      if (cell && !shapeGrid[s][f]) ghostCells.add(`${s}:${f}`);
+    }));
+  }
+
+  // 3) Slide the highlight to the frets in play.
+  const span = box ? playedSpan(shapeGrid, box) : null;
+  activeBand = span ? { lo: span.lo, hi: span.hi } : null;
+  if (!span) activeStops = null;
+  if (span) {
+    const { y1, y2 } = bandEdges(span.lo, span.hi);
+    // First reveal jumps into place; later moves glide.
+    if (highlight.getAttribute("opacity") === "0") {
+      highlight.style.transition = "none";
+      highlight.setAttribute("y", y1);
+      highlight.setAttribute("height", y2 - y1);
+      requestAnimationFrame(() => { highlight.style.transition = ""; });
+    } else {
+      highlight.setAttribute("y", y1);
+      highlight.setAttribute("height", y2 - y1);
+    }
+    highlight.setAttribute("opacity", 0.07);
+  } else {
+    highlight.setAttribute("opacity", 0);
+  }
+
+  // 4) Remember what's playable — a run may only use the shape's notes,
+  //    even though the rest of the scale is still drawn around it.
+  visibleCells = new Set();
+  (shapeGrid ?? grid).forEach((row, s) => row.forEach((cell, f) => {
+    if (cell) visibleCells.add(`${s}:${f}`);
+  }));
+  if (pathOn && pathFrom && !visibleCells.has(cellId(pathFrom))) clearPath();
+  if (pathOn && pathTo && !visibleCells.has(cellId(pathTo))) { pathTo = null; pathStops = []; pathResult = null; }
+  if (pathOn && pathStops.length) {
+    const kept = pathStops.filter(s => visibleCells.has(cellId(s)));
+    if (kept.length !== pathStops.length) { pathStops = kept; recomputePath({ force: true }); }
+  }
+
+  // Nothing picked yet, and a shape is on screen: trace all of it.
+  if (pathOn && box && !pathFrom && !pathTo && !skipAutoPath) {
+    autoPathForPosition(shapeGrid);
+  }
+
+  // 5) Move the notes, then trace the run over them.
+  renderNotes(grid, mode);
+  renderPathLine({ animate });
+  renderWindowHandle();
+
+  const pathLabel = document.getElementById("pathLabel");
+  if (pathLabel) {
+    if (!pathOn) pathLabel.textContent = "";
+    else if (!pathFrom) pathLabel.textContent = "tap a note to start";
+    else if (!pathTo) pathLabel.textContent = "now tap the note to reach";
+    else if (!pathResult) pathLabel.textContent = "no playable run between those";
+    else {
+      const frets = pathResult.cells.map(c => c.fret);
+      const locked = pathStops.filter(s => s.locked).length;
+      const pinned = pathStops.length - locked;
+      const held = (locked ? ` · ${locked} locked` : "") +
+                   (pinned ? ` · ${pinned} pinned` : "");
+      pathLabel.textContent =
+        `${pathResult.cells.length} notes · frets ${Math.min(...frets)}–${Math.max(...frets)}${held}`;
+    }
+  }
+  syncPlayButton();
+
+  // 6) Readout + arrow availability.
+  const posLabel = document.getElementById("posLabel");
+  if (posLabel) {
+    if (!box) {
+      posLabel.textContent = cagedOn ? "no playable position found" : "";
+    } else {
+      const shape = box.shape ? `${box.shape} shape · ` : "";
+      const lo = span ? span.lo : box.lo;
+      const hi = span ? span.hi : box.hi;
+      posLabel.textContent =
+        `${posIndex + 1}/${boxCount} · ${shape}frets ${lo}–${hi}`;
+    }
+  }
+  const prev = document.getElementById("prevPos");
+  const next = document.getElementById("nextPos");
+  if (prev && next) {
+    prev.disabled = !box || posIndex === 0;
+    next.disabled = !box || posIndex >= boxCount - 1;
+  }
+}
+
+// ============================================================
+// CONTROLS
+// ============================================================
+
+// The toolbar's shape button names whichever system applies: CAGED for
+// the natural modes, searched positions otherwise, voicings for chords.
+function syncCagedControls() {
+  const type   = document.getElementById("scale").value;
+  const chords = isChordMode();
+  const caged  = supportsCaged(type);
+  const btn    = document.getElementById("cagedBtn");
+  const nav    = document.getElementById("cagedNav");
+
+  // A chord is only ever one grip, so voicing cycling is always on.
+  btn.disabled = chords;
+  btn.title = chords
+    ? "Chords are shown one grip at a time — step through them below"
+    : caged
+      ? "Show one CAGED shape at a time"
+      : "Show playable hand positions for this scale";
+  btn.classList.toggle("active", chords || cagedOn);
+  nav.classList.toggle("show", chords || cagedOn);
+
+  // Runs are for scales and arpeggios; a chord isn't travelled through.
+  const pathBtn = document.getElementById("pathBtn");
+  const pathNav = document.getElementById("pathNav");
+  if (chords) { pathOn = false; clearPath(); }
+  pathBtn.disabled = chords;
+  pathBtn.classList.toggle("active", pathOn);
+  pathBtn.title = chords
+    ? "Runs apply to scales and arpeggios, not to chord grips"
+    : cagedOn
+      ? "Trace a run inside the position on screen"
+      : "Pick a starting note and a target note to build a run";
+  pathNav.classList.toggle("show", pathOn);
+  document.getElementById("board").classList.toggle("picking", pathOn);
+
+  const ghostField = document.getElementById("ghostField");
+  const ghostBtn   = document.getElementById("ghostBtn");
+  ghostField.classList.toggle("show", chords);
+  ghostBtn.classList.toggle("active", ghostOn);
+  ghostBtn.title = chords && ghostOn
+    ? "Tap a note to silence it, or a receded one to play it instead"
+    : "Show the chord's other tones, wherever they fall";
+  // With ghosts up, the notes are editable, so they should look it.
+  document.getElementById("board").classList.toggle("editing", chords && ghostOn);
+
+  // Open strings, likewise — but only where the chord has one to ring.
+  const openField = document.getElementById("openField");
+  const openBtn   = document.getElementById("openBtn");
+  const canOpen   = chords && hasOpenVoicing(
+    document.getElementById("root").value,
+    document.getElementById("scale").value);
+  if (!canOpen) openOn = false;
+  openField.classList.toggle("show", chords);
+  openBtn.disabled = !canOpen;
+  openBtn.classList.toggle("active", openOn);
+  openBtn.title = !canOpen
+    ? "No open string belongs to this chord"
+    : openOn
+      ? "Open strings may ring under a grip anywhere on the neck"
+      : "Open strings only where the window reaches the nut";
+
+  // Strumming is a chord idea too. Leaving chord mode leaves no grip to
+  // play, so the button has nothing to refer to.
+  document.getElementById("strumField").classList.toggle("show", chords);
+  document.getElementById("strumBtn").classList.toggle("show", chords);
+  if (!chords) currentVoicing = null;
+  syncStrumButton();
+}
+
+/**
+ * Load the material menu with scales or with arpeggios. Both are just
+ * note sets to everything downstream, so switching between them needs no
+ * more than a different menu.
+ */
+function fillMaterialMenu(kind) {
+  const sel = document.getElementById("scale");
+  sel.innerHTML = "";
+  const groups = groupsFor(kind);
+  Object.entries(groups).forEach(([group, names]) => {
+    const og = document.createElement("optgroup");
+    og.label = group;
+    names.forEach(n => og.appendChild(new Option(n, n)));
+    sel.appendChild(og);
+  });
+  sel.value = kind === "scale" ? MAJOR_SCALE : Object.values(groups)[0][0];
+}
+
+function initControls() {
+  const rootSel = document.getElementById("root");
+  rootOptions.forEach(n => rootSel.appendChild(new Option(n, n)));
+  rootSel.value = "G";
+
+  fillMaterialMenu("scale");
+
+  // Switching between scales and arpeggios reloads the menu beneath it.
+  document.getElementById("kind").addEventListener("change", e => {
+    fillMaterialMenu(e.target.value);
+    posIndex = 0;
+    clearPath();
+    syncCagedControls();
+    render();
+  });
+
+  // Changing root or scale restarts at the lowest shape, and voids any
+  // run — its notes may not exist in the new scale.
+  ["root", "scale"].forEach(id =>
+    document.getElementById(id).addEventListener("change", () => {
+      posIndex = 0;
+      clearPath();
+      syncCagedControls();
+      render();
+    }));
+  document.getElementById("labels").addEventListener("change", () => render());
+
+  document.getElementById("cagedBtn").addEventListener("click", () => {
+    cagedOn = !cagedOn;
+    posIndex = 0;
+    clearPath();
+    syncCagedControls();
+    render();
+  });
+  document.getElementById("ghostBtn").addEventListener("click", () => {
+    ghostOn = !ghostOn;
+    syncCagedControls();
+    render();
+  });
+  document.getElementById("playBtn").addEventListener("click", () => {
+    if (playerKind === "run") stopSound(); else playRun();
+  });
+  const bpm = document.getElementById("bpm");
+  bpm.addEventListener("input", () => {
+    document.getElementById("bpmLabel").textContent = bpm.value;
+  });
+
+  document.getElementById("strumBtn").addEventListener("click", () => {
+    if (playerKind === "chord") stopSound(); else strumChord();
+  });
+  const spread = document.getElementById("spread");
+  const showSpread = () => {
+    const ms = Math.round(strumGap(Number(spread.value) / 100) * 1000);
+    document.getElementById("spreadLabel").textContent = `${ms} ms`;
+  };
+  spread.addEventListener("input", showSpread);
+  showSpread();
+
+  document.getElementById("openBtn").addEventListener("click", () => {
+    openOn = !openOn;
+    posIndex = 0;   // a different set of grips — start at the top of it
+    syncCagedControls();
+    render();
+  });
+
+  document.getElementById("pathBtn").addEventListener("click", () => {
+    pathOn = !pathOn;
+    clearPath();
+    syncCagedControls();
+    render();
+  });
+  document.getElementById("clearPath").addEventListener("click", () => {
+    clearPath();
+    skipAutoPath = true;      // leave the board empty for hand-picking
+    render();
+  });
+
+  // Moving to another shape starts the run over.
+  document.getElementById("prevPos").addEventListener("click", () => {
+    if (posIndex > 0) { posIndex--; clearPath(); render(); }
+  });
+  document.getElementById("nextPos").addEventListener("click", () => {
+    posIndex++; clearPath(); render();
+  });
+
+  // Arrow keys cycle shapes when position mode is on. Down the board is
+  // up the neck, so both axes are honoured.
+  document.addEventListener("keydown", e => {
+    if (!cagedOn && !isChordMode()) return;
+    const active = document.activeElement;
+    if (active && (active.tagName === "SELECT" || active.tagName === "INPUT")) return;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") { posIndex++; render(); }
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+      if (posIndex > 0) { posIndex--; render(); }
+    }
+  });
+
+  // Dragging is tracked on the document so the pointer can stray off the
+  // note without the drag breaking.
+  document.addEventListener("pointermove", onDragMove);
+  document.addEventListener("pointerup", endDrag);
+  document.addEventListener("pointercancel", endDrag);
+
+  syncCagedControls();
+  render();
+}
+
+drawBoard();
+initControls();
