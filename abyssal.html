@@ -251,6 +251,10 @@ const Audio = {
 
 function buildAudio(){
   const ctx = Audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
+  // WebKit hands over the audio session only for something played during the
+  // gesture itself, so claim it before spending any time on the graph.
+  unlockAudioSession(ctx);
+  if (ctx.state !== 'running') ctx.resume().catch(() => {});
 
   // —— master chain, built back to front ——
   const master = ctx.createGain();
