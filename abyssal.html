@@ -491,7 +491,9 @@ function subBass(t, midi, vel, dur){
 
 /** retune the drone to a new chord root, with portamento */
 function padTo(midi, t){
-  if (!Audio.padOsc.length) return;
+  const at = Clock.toAudio(t);
+  if (!Audio.padOsc.length || at === null) return;
+  t = at;
   const f = mtof(midi);
   Audio.padOsc.forEach(o => {
     o.frequency.cancelScheduledValues(t);
@@ -502,6 +504,9 @@ function padTo(midi, t){
 
 /** the pump: a dip on beats 1 and 3 with a 180ms recovery */
 function schedulePump(t, depth){
+  const at = Clock.toAudio(t);
+  if (!Audio.ready || at === null) return;
+  t = at;
   const g = Audio.pump.gain;
   g.cancelScheduledValues(t);
   g.setValueAtTime(1, t);
@@ -556,7 +561,38 @@ const M = {
   nextSilBar: 6,
   started: false,
   muted: false,
-  paused: false
+  paused: false,
+  audioError: null
+};
+
+/**
+ * The piece runs on "piece time", not on the AudioContext.
+ * The audio clock is authoritative whenever it is running — that's what keeps
+ * light and sound on the same frame — but if audio never starts, or is blocked,
+ * or dies, piece time falls back to the wall clock and the visuals carry on.
+ * Previously everything read AudioContext.currentTime directly, so one failure
+ * in the audio graph took the entire piece down with it.
+ */
+const Clock = {
+  perf0: 0,
+  audioOffset: null,            // ctx.currentTime - pieceTime, once audio is live
+  begin(){ this.perf0 = performance.now(); this.audioOffset = null; },
+  now(){
+    return this.audioOffset !== null
+      ? Audio.ctx.currentTime - this.audioOffset
+      : (performance.now() - this.perf0) / 1000;
+  },
+  /** latch onto the audio clock without discontinuity in piece time */
+  sync(){
+    if (this.audioOffset === null && Audio.ready && Audio.ctx && Audio.ctx.state === 'running'){
+      this.audioOffset = Audio.ctx.currentTime - (performance.now() - this.perf0) / 1000;
+    }
+  },
+  /** piece time → AudioContext time, or null when there is no audio to schedule */
+  toAudio(t){ return this.audioOffset === null ? null : t + this.audioOffset; },
+  /** drop a gap (a backgrounded tab on the fallback clock) instead of catching up */
+  rebase(t){ if (this.audioOffset === null) this.perf0 = performance.now() - t * 1000; },
+  get onAudio(){ return this.audioOffset !== null; }
 };
 
 const visualQueue = [];
@@ -656,13 +692,16 @@ function arpNote(){
 function emit(time, midi, vel, dur, voice){
   if (M.muted) vel = 0;
   const ev = { time, midi, vel, dur, voice, tension: M.tension, chordId: M.chordId, phase: M.phaseIdx };
-  if (vel > 0.002){
-    switch (voice){
-      case 'keys':   fmKeys(time, midi, vel, dur, M.phase.bright); break;
-      case 'pluck':  ksPluck(time, midi, vel, dur, false); break;
-      case 'rpluck': ksPluck(time, midi, vel, dur, true); break;
-      case 'sub':    subBass(time, midi, vel, dur); break;
-    }
+  const at = Clock.toAudio(time);
+  if (vel > 0.002 && at !== null){
+    try {
+      switch (voice){
+        case 'keys':   fmKeys(at, midi, vel, dur, M.phase.bright); break;
+        case 'pluck':  ksPluck(at, midi, vel, dur, false); break;
+        case 'rpluck': ksPluck(at, midi, vel, dur, true); break;
+        case 'sub':    subBass(at, midi, vel, dur); break;
+      }
+    } catch (e) { noteAudioFailure(e); }
   }
   // The queue MUST stay time-ordered: runs, hook cells and cascades emit notes
   // ahead of the step cursor, so a naive push puts a far-future event at the head
@@ -856,6 +895,9 @@ function advance(){
 
 /** phase changes move the mix, not just the notes */
 function applyPhaseMix(t){
+  const at = Clock.toAudio(t);
+  if (!Audio.ready || at === null) return;
+  t = at;
   const p = M.phase;
   const k = 0.9;
   Audio.bus.gain.setTargetAtTime(0.9 * p.lvl, t, k);
@@ -868,8 +910,15 @@ function applyPhaseMix(t){
 
 let schedTimer = null;
 function schedulerTick(){
-  if (!Audio.ready || M.paused) return;
-  const ahead = Audio.ctx.currentTime + 0.1;
+  if (!M.started || M.paused) return;
+  try { tickBody(); } catch (e) { noteAudioFailure(e); }
+}
+function tickBody(){
+  Clock.sync();
+  // a backgrounded tab on the wall clock opens a gap; skip it rather than
+  // scheduling several thousand steps at once
+  if (Clock.now() - M.nextTime > 1) Clock.rebase(M.nextTime - 0.05);
+  const ahead = Clock.now() + 0.1;
   let guard = 0;
   while (M.nextTime < ahead && guard++ < 80) scheduleStep();
 }
@@ -1118,13 +1167,13 @@ function render(dt){
   makeGradients();
 
   // ——— drain the note queue: audio and light land on the same frame ———
-  if (Audio.ready){
-    const now = Audio.ctx.currentTime;
+  {
+    const now = Clock.now();
     while (visualQueue.length && visualQueue[0].time <= now){
       spawnNote(visualQueue.shift());
     }
   }
-  if (FX.sigilQueue && Audio.ready && Audio.ctx.currentTime >= FX.sigilQueue.at){
+  if (FX.sigilQueue && Clock.now() >= FX.sigilQueue.at){
     spawnSigil(FX.sigilQueue.n, FX.sigilQueue.tension);
     FX.sigilQueue = null;
   }
@@ -1591,6 +1640,7 @@ const el = {
   phase: document.getElementById('phase'),
   meta:  document.getElementById('meta'),
   rare:  document.getElementById('rare'),
+  hint:  document.getElementById('hint'),
   keys:  document.getElementById('keys')
 };
 let rareTimer = null;
@@ -1611,32 +1661,54 @@ function updateChrome(dt){
   el.meta.innerHTML =
     'seed ' + SEED + '<br>' +
     M.bpm + ' bpm · ' + Math.round(M.swing * 100) + '% swing<br>' +
-    (M.muted ? 'muted' : M.paused ? 'paused' : Math.round(fps) + ' fps');
+    (M.muted ? 'muted' : M.paused ? 'paused' : Math.round(fps) + ' fps') +
+    (M.started && !Clock.onAudio ? '<br>silent · visual only' : '');
 }
 
 function start(){
   if (M.started) return;
   M.started = true;
-  buildAudio();
-  // some browsers hand back a suspended context even after a real gesture
-  if (Audio.ctx.state !== 'running') Audio.ctx.resume().catch(() => {});
-  setDelayTime(M.bpm);
-  applyPhaseMix(Audio.ctx.currentTime);
-  M.nextTime = Audio.ctx.currentTime + 0.15;
-  // An exponential ramp spends nearly all its time near the bottom: from 0.0001 it
-  // is still at 1% of target halfway through. Start audible and get out of the way.
-  Audio.master.gain.setValueAtTime(0.12, Audio.ctx.currentTime);
-  Audio.master.gain.exponentialRampToValueAtTime(0.85, Audio.ctx.currentTime + 2);
-  Audio.padGain.gain.setTargetAtTime(M.phase.pad, Audio.ctx.currentTime, 1.2);
+  Clock.begin();
+  M.nextTime = 0.15;
+
+  // Audio is an enhancement, not a prerequisite. If any of this throws the piece
+  // still runs — silently, and saying so — instead of going dark.
+  try {
+    buildAudio();
+    if (Audio.ctx.state !== 'running') Audio.ctx.resume().catch(() => {});
+    Clock.sync();
+    setDelayTime(M.bpm);
+    applyPhaseMix(M.nextTime);
+    // An exponential ramp spends nearly all its time near the bottom: from 0.0001
+    // it is still at 1% of target halfway through. Start audible, get out of the way.
+    const t = Audio.ctx.currentTime;
+    Audio.master.gain.setValueAtTime(0.12, t);
+    Audio.master.gain.exponentialRampToValueAtTime(0.85, t + 2);
+    Audio.padGain.gain.setTargetAtTime(M.phase.pad, t, 1.2);
+  } catch (e) {
+    noteAudioFailure(e);
+  }
+
   schedTimer = setInterval(schedulerTick, 25);
   el.gate.classList.add('gone');
   setTimeout(() => { el.gate.style.display = 'none'; }, 1700);
-  // if the browser still won't let it through, say so rather than sitting there silent
   setTimeout(() => {
-    if (Audio.ready && Audio.ctx.state !== 'running'){
-      el.hint.innerHTML = 'audio blocked — click the page<br>? keys';
+    if (!Clock.onAudio && !M.audioError) noteAudioFailure(new Error('context ' +
+      (Audio.ctx ? Audio.ctx.state : 'unavailable')));
+  }, 900);
+}
+
+/** Say what went wrong, on screen, instead of failing silently.
+    This runs inside catch blocks, so it must not be able to throw itself. */
+function noteAudioFailure(err){
+  try {
+    if (M.audioError) return;
+    M.audioError = String((err && err.message) || err || 'unknown');
+    if (el && el.hint){
+      el.hint.innerHTML = 'no audio: ' + M.audioError.slice(0, 44) +
+                          '<br>click to retry &nbsp;·&nbsp; ? keys';
     }
-  }, 700);
+  } catch (e) { /* reporting must never break playback */ }
 }
 
 function reseed(){
@@ -1651,11 +1723,11 @@ function reseed(){
   for (const s of shocks) s.a = false;
   for (const g of sigils) g.a = false;
   visualQueue.length = 0;
-  if (Audio.ready) M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.05);
+  M.nextTime = Math.max(M.nextTime, Clock.now() + 0.05);
 }
 
 function jumpToPhase(i){
-  if (!Audio.ready) return;
+  if (!M.started) return;
   const bar = barOf(M.step);
   const cyc = Math.floor(bar / CYCLE_BARS);
   // always jump forward — landing behind the cursor would replay the same bars
@@ -1663,22 +1735,26 @@ function jumpToPhase(i){
   if (target <= bar) target += CYCLE_BARS;
   M.step = target * 16;
   M.phaseIdx = i; M.phase = PHASES[i];
-  applyPhaseMix(Audio.ctx.currentTime);
-  M.nextTime = Audio.ctx.currentTime + 0.05;
+  M.nextTime = Clock.now() + 0.05;
+  applyPhaseMix(M.nextTime);
 }
 
 function setPaused(p){
   M.paused = p;
-  if (!Audio.ready) return;
-  if (p) Audio.ctx.suspend();
-  else Audio.ctx.resume().then(() => { M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.08); });
+  if (!Audio.ready || !Audio.ctx) return;
+  if (p) Audio.ctx.suspend().catch(() => {});
+  else Audio.ctx.resume().then(() => {
+    Clock.sync();
+    M.nextTime = Math.max(M.nextTime, Clock.now() + 0.08);
+  }).catch(() => {});
 }
 
 addEventListener('pointerdown', () => {
-  if (Audio.ready && !M.paused && Audio.ctx.state === 'suspended'){
+  if (Audio.ready && Audio.ctx && !M.paused && Audio.ctx.state !== 'running'){
     Audio.ctx.resume().then(() => {
-      M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.08);
-      el.hint.innerHTML = '? keys';
+      Clock.sync();
+      M.nextTime = Math.max(M.nextTime, Clock.now() + 0.08);
+      if (Clock.onAudio){ M.audioError = null; el.hint.innerHTML = '? keys'; }
     }).catch(() => {});
   }
 });
@@ -1691,6 +1767,7 @@ addEventListener('keydown', e => {
   else if (k === 'm' || k === 'M'){
     M.muted = !M.muted;
     if (Audio.ready) Audio.master.gain.setTargetAtTime(M.muted ? 0.0001 : 0.85, Audio.ctx.currentTime, 0.12);
+    Clock.sync();
   }
   else if (k === 'r' || k === 'R') reseed();
   else if (k >= '1' && k <= '4') jumpToPhase(+k - 1);
@@ -1714,8 +1791,9 @@ document.addEventListener('visibilitychange', () => {
   if (!Audio.ready) return;
   if (document.hidden) Audio.ctx.suspend();
   else if (!M.paused) Audio.ctx.resume().then(() => {
-    M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.1);
-  });
+    Clock.sync();
+    M.nextTime = Math.max(M.nextTime, Clock.now() + 0.1);
+  }).catch(() => {});
 });
 
 /* ——— main loop ——— */
