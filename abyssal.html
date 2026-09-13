@@ -588,6 +588,16 @@ const Clock = {
       this.audioOffset = Audio.ctx.currentTime - (performance.now() - this.perf0) / 1000;
     }
   },
+  /** Let go of the audio clock without a jump in piece time. Safari freezes
+      currentTime while a context is 'interrupted'; staying latched to it would
+      freeze the visuals too. */
+  unsync(){
+    if (this.audioOffset !== null){
+      const t = this.now();
+      this.audioOffset = null;
+      this.perf0 = performance.now() - t * 1000;
+    }
+  },
   /** piece time → AudioContext time, or null when there is no audio to schedule */
   toAudio(t){ return this.audioOffset === null ? null : t + this.audioOffset; },
   /** drop a gap (a backgrounded tab on the fallback clock) instead of catching up */
@@ -914,7 +924,13 @@ function schedulerTick(){
   try { tickBody(); } catch (e) { noteAudioFailure(e); }
 }
 function tickBody(){
-  Clock.sync();
+  const st = Audio.ctx ? Audio.ctx.state : null;
+  if (st === 'running') Clock.sync();
+  else if (st && !M.paused && !document.hidden){
+    Clock.unsync();
+    // not every browser fires statechange reliably, so notice it here too
+    if (st === SAFARI_INTERRUPTED) noteAudioFailure(new Error(SAFARI_INTERRUPTED));
+  }
   // a backgrounded tab on the wall clock opens a gap; skip it rather than
   // scheduling several thousand steps at once
   if (Clock.now() - M.nextTime > 1) Clock.rebase(M.nextTime - 0.05);
@@ -1665,36 +1681,108 @@ function updateChrome(dt){
     (M.started && !Clock.onAudio ? '<br>silent · visual only' : '');
 }
 
+/* ——— Starting audio, on browsers that make it difficult ———
+   Safari has a fourth AudioContext state that is not in the Web Audio spec:
+   'interrupted'. It appears when WebKit loses the audio session — an incoming
+   call, another app or tab taking audio, the screen locking, or the iOS ring/
+   silent switch — and while interrupted, currentTime stops advancing entirely.
+   resume() alone does not always bring it back; sometimes the context has to be
+   thrown away and rebuilt. None of this is reachable from Chromium, which is why
+   it took a report from a real browser to find. */
+
+const SAFARI_INTERRUPTED = 'interrupted';
+
+/** Claim the audio session. iOS hands it over only for a buffer played during a gesture. */
+function unlockAudioSession(ctx){
+  try {
+    const b = ctx.createBuffer(1, 1, ctx.sampleRate);
+    const src = ctx.createBufferSource();
+    src.buffer = b;
+    src.connect(ctx.destination);
+    src.start(0);
+  } catch (e) { /* best effort */ }
+}
+
+/** Everything that has to happen once a context is actually running. */
+function armAudio(){
+  Clock.sync();
+  if (!Clock.onAudio) return false;
+  setDelayTime(M.bpm);
+  applyPhaseMix(Math.max(M.nextTime, Clock.now()));
+  const t = Audio.ctx.currentTime;
+  Audio.master.gain.cancelScheduledValues(t);
+  // An exponential ramp spends nearly all its time near the bottom: from 0.0001
+  // it is still at 1% of target halfway through. Start audible, get out of the way.
+  Audio.master.gain.setValueAtTime(M.muted ? 0.0001 : 0.12, t);
+  if (!M.muted) Audio.master.gain.exponentialRampToValueAtTime(0.85, t + 2);
+  Audio.padGain.gain.setTargetAtTime(M.phase.pad, t, 1.2);
+  clearAudioFailure();
+  return true;
+}
+
+/** Watch for the session coming back on its own, and for losing it mid-piece. */
+function watchContext(ctx){
+  ctx.onstatechange = () => {
+    const st = ctx.state;
+    if (st === 'running') armAudio();
+    else if (st === SAFARI_INTERRUPTED || st === 'suspended'){
+      if (!M.paused && !document.hidden){
+        Clock.unsync();
+        if (st === SAFARI_INTERRUPTED) noteAudioFailure(new Error(SAFARI_INTERRUPTED));
+      }
+    }
+  };
+}
+
+/** Build the graph and try to get it running. Used for the first start and every retry. */
+function initAudio(){
+  try {
+    buildAudio();
+    watchContext(Audio.ctx);
+    unlockAudioSession(Audio.ctx);
+    if (Audio.ctx.state === 'running'){ armAudio(); return; }
+    Audio.ctx.resume().then(() => {
+      if (Audio.ctx.state === 'running') armAudio();
+      else noteAudioFailure(new Error('context ' + Audio.ctx.state));
+    }).catch(e => noteAudioFailure(e));
+  } catch (e) {
+    noteAudioFailure(e);
+  }
+}
+
+/** A context stuck in 'interrupted' sometimes only recovers by being replaced.
+    Capped: browsers limit how many contexts a page may create, and on a device
+    where the session is simply unavailable, retrying forever would exhaust them. */
+let rebuilds = 0;
+const MAX_REBUILDS = 3;
+function rebuildAudio(){
+  if (rebuilds >= MAX_REBUILDS) return;
+  rebuilds++;
+  Clock.unsync();
+  const old = Audio.ctx;
+  Audio.ready = false;
+  Audio.ctx = null;
+  if (old){ try { old.onstatechange = null; old.close(); } catch (e) {} }
+  initAudio();
+}
+
 function start(){
   if (M.started) return;
   M.started = true;
   Clock.begin();
   M.nextTime = 0.15;
 
-  // Audio is an enhancement, not a prerequisite. If any of this throws the piece
+  // Audio is an enhancement, not a prerequisite. If none of this works the piece
   // still runs — silently, and saying so — instead of going dark.
-  try {
-    buildAudio();
-    if (Audio.ctx.state !== 'running') Audio.ctx.resume().catch(() => {});
-    Clock.sync();
-    setDelayTime(M.bpm);
-    applyPhaseMix(M.nextTime);
-    // An exponential ramp spends nearly all its time near the bottom: from 0.0001
-    // it is still at 1% of target halfway through. Start audible, get out of the way.
-    const t = Audio.ctx.currentTime;
-    Audio.master.gain.setValueAtTime(0.12, t);
-    Audio.master.gain.exponentialRampToValueAtTime(0.85, t + 2);
-    Audio.padGain.gain.setTargetAtTime(M.phase.pad, t, 1.2);
-  } catch (e) {
-    noteAudioFailure(e);
-  }
+  initAudio();
 
   schedTimer = setInterval(schedulerTick, 25);
   el.gate.classList.add('gone');
   setTimeout(() => { el.gate.style.display = 'none'; }, 1700);
   setTimeout(() => {
-    if (!Clock.onAudio && !M.audioError) noteAudioFailure(new Error('context ' +
-      (Audio.ctx ? Audio.ctx.state : 'unavailable')));
+    if (!Clock.onAudio && !M.audioError){
+      noteAudioFailure(new Error('context ' + (Audio.ctx ? Audio.ctx.state : 'unavailable')));
+    }
   }, 900);
 }
 
@@ -1702,62 +1790,42 @@ function start(){
     This runs inside catch blocks, so it must not be able to throw itself. */
 function noteAudioFailure(err){
   try {
-    if (M.audioError) return;
-    M.audioError = String((err && err.message) || err || 'unknown');
-    if (el && el.hint){
-      el.hint.innerHTML = 'no audio: ' + M.audioError.slice(0, 44) +
-                          '<br>click to retry &nbsp;·&nbsp; ? keys';
-    }
+    const msg = String((err && err.message) || err || 'unknown');
+    if (M.audioError === msg) return;
+    M.audioError = msg;
+    if (!el || !el.hint) return;
+    el.hint.innerHTML = msg === SAFARI_INTERRUPTED
+      ? 'safari lost the audio session<br>tap to retry &nbsp;·&nbsp; check the silent switch'
+      : 'no audio: ' + msg.slice(0, 42) + '<br>tap to retry &nbsp;·&nbsp; ? keys';
   } catch (e) { /* reporting must never break playback */ }
 }
 
-function reseed(){
-  SEED = (Math.random() * 0xFFFFFF | 0).toString(36).toUpperCase().padStart(4,'0');
-  rng = mulberry32(seedFromString(SEED));
-  const u = new URL(location.href); u.searchParams.set('seed', SEED);
-  history.replaceState(null, '', u);
-  M.voicing = []; M.pool = []; M.degree = 0; M.walkPos = 0;
-  silhouettes.length = 0;
-  for (const p of parts) p.a = false;
-  for (const c of cols) c.a = false;
-  for (const s of shocks) s.a = false;
-  for (const g of sigils) g.a = false;
-  visualQueue.length = 0;
-  M.nextTime = Math.max(M.nextTime, Clock.now() + 0.05);
+function clearAudioFailure(){
+  try {
+    if (!M.audioError) return;
+    M.audioError = null;
+    if (el && el.hint) el.hint.innerHTML = '? keys';
+  } catch (e) {}
 }
 
-function jumpToPhase(i){
-  if (!M.started) return;
-  const bar = barOf(M.step);
-  const cyc = Math.floor(bar / CYCLE_BARS);
-  // always jump forward — landing behind the cursor would replay the same bars
-  let target = cyc * CYCLE_BARS + PHASE_START[i];
-  if (target <= bar) target += CYCLE_BARS;
-  M.step = target * 16;
-  M.phaseIdx = i; M.phase = PHASES[i];
-  M.nextTime = Clock.now() + 0.05;
-  applyPhaseMix(M.nextTime);
+/** Every pointer press is a fresh chance at the audio session. */
+let retryAt = 0;
+function retryAudio(){
+  if (!M.started || M.paused) return;
+  const now = performance.now();
+  if (now - retryAt < 400) return;
+  retryAt = now;
+  if (!Audio.ctx){ initAudio(); return; }
+  const st = Audio.ctx.state;
+  if (st === 'running'){ armAudio(); return; }
+  Audio.ctx.resume().then(() => {
+    if (Audio.ctx.state === 'running') armAudio();
+    else if (Audio.ctx.state === SAFARI_INTERRUPTED) rebuildAudio();  // resume wasn't enough
+  }).catch(() => rebuildAudio());
 }
+addEventListener('pointerdown', retryAudio);
+addEventListener('touchend', retryAudio);
 
-function setPaused(p){
-  M.paused = p;
-  if (!Audio.ready || !Audio.ctx) return;
-  if (p) Audio.ctx.suspend().catch(() => {});
-  else Audio.ctx.resume().then(() => {
-    Clock.sync();
-    M.nextTime = Math.max(M.nextTime, Clock.now() + 0.08);
-  }).catch(() => {});
-}
-
-addEventListener('pointerdown', () => {
-  if (Audio.ready && Audio.ctx && !M.paused && Audio.ctx.state !== 'running'){
-    Audio.ctx.resume().then(() => {
-      Clock.sync();
-      M.nextTime = Math.max(M.nextTime, Clock.now() + 0.08);
-      if (Clock.onAudio){ M.audioError = null; el.hint.innerHTML = '? keys'; }
-    }).catch(() => {});
-  }
-});
 el.gate.addEventListener('click', start);
 el.gate.addEventListener('touchstart', e => { e.preventDefault(); start(); }, { passive:false });
 
