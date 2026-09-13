@@ -722,6 +722,11 @@ function scheduleStep(){
       FX.sigilQueue = { n: Math.max(3, M.voicing.length), tension: M.tension, at: t };
       emit(t, c.root - 12, 0.55 + rng() * 0.2, sd * 16 * (chance(0.4) ? 2 : 1), 'sub');
     }
+    if (M.step === 0){
+      // a soft roll up the first voicing, so the very first second has something in it
+      M.voicing.forEach((v, i) => emit(t + i * 0.055, v, 0.74 - i * 0.045, sd * 9, 'keys'));
+      if (M.pool.length) emit(t + 0.30, M.pool[M.pool.length - 1] + 12, 0.42, sd * 10, 'pluck');
+    }
     if (bar % 2 === 0) M.pattern = pick(PATTERNS);
     if (bar >= M.nextSilBar){                  // something passes every 40-90s
       M.nextSilBar = bar + ri(16, 36);
@@ -1613,15 +1618,25 @@ function start(){
   if (M.started) return;
   M.started = true;
   buildAudio();
+  // some browsers hand back a suspended context even after a real gesture
+  if (Audio.ctx.state !== 'running') Audio.ctx.resume().catch(() => {});
   setDelayTime(M.bpm);
   applyPhaseMix(Audio.ctx.currentTime);
   M.nextTime = Audio.ctx.currentTime + 0.15;
-  Audio.master.gain.setValueAtTime(0.0001, Audio.ctx.currentTime);
-  Audio.master.gain.exponentialRampToValueAtTime(0.85, Audio.ctx.currentTime + 6);
-  Audio.padGain.gain.setTargetAtTime(M.phase.pad, Audio.ctx.currentTime, 3);
+  // An exponential ramp spends nearly all its time near the bottom: from 0.0001 it
+  // is still at 1% of target halfway through. Start audible and get out of the way.
+  Audio.master.gain.setValueAtTime(0.12, Audio.ctx.currentTime);
+  Audio.master.gain.exponentialRampToValueAtTime(0.85, Audio.ctx.currentTime + 2);
+  Audio.padGain.gain.setTargetAtTime(M.phase.pad, Audio.ctx.currentTime, 1.2);
   schedTimer = setInterval(schedulerTick, 25);
   el.gate.classList.add('gone');
   setTimeout(() => { el.gate.style.display = 'none'; }, 1700);
+  // if the browser still won't let it through, say so rather than sitting there silent
+  setTimeout(() => {
+    if (Audio.ready && Audio.ctx.state !== 'running'){
+      el.hint.innerHTML = 'audio blocked — click the page<br>? keys';
+    }
+  }, 700);
 }
 
 function reseed(){
@@ -1659,6 +1674,14 @@ function setPaused(p){
   else Audio.ctx.resume().then(() => { M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.08); });
 }
 
+addEventListener('pointerdown', () => {
+  if (Audio.ready && !M.paused && Audio.ctx.state === 'suspended'){
+    Audio.ctx.resume().then(() => {
+      M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.08);
+      el.hint.innerHTML = '? keys';
+    }).catch(() => {});
+  }
+});
 el.gate.addEventListener('click', start);
 el.gate.addEventListener('touchstart', e => { e.preventDefault(); start(); }, { passive:false });
 
