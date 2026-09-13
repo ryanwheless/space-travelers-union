@@ -1,0 +1,1721 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ABYSSAL</title>
+<style>
+  :root{
+    --ink:#04060f;
+    --ui:#7fe9dd;
+    --ui-dim:rgba(127,233,221,.42);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--ink);color:var(--ui);overflow:hidden;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    -webkit-font-smoothing:antialiased;
+    touch-action:manipulation;
+  }
+  #stage{position:fixed;inset:0;display:block;width:100%;height:100%}
+
+  /* ——— overlay chrome ——— */
+  #ui{position:fixed;inset:0;pointer-events:none;transition:opacity .5s ease}
+  #ui.hidden{opacity:0}
+  .corner{
+    position:absolute;font-size:10px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--ui-dim);text-shadow:0 0 12px rgba(95,245,230,.35);white-space:nowrap;
+  }
+  #phase{top:max(18px,env(safe-area-inset-top));left:max(20px,env(safe-area-inset-left));
+    font-size:11px;letter-spacing:.42em;color:rgba(159,247,238,.78)}
+  #phase b{font-weight:400;display:inline-block;min-width:74px}
+  #phase i{font-style:normal;opacity:.45;margin-left:10px}
+  #meta{bottom:max(18px,env(safe-area-inset-bottom));left:max(20px,env(safe-area-inset-left));line-height:1.9}
+  #hint{bottom:max(18px,env(safe-area-inset-bottom));right:max(20px,env(safe-area-inset-right));text-align:right;line-height:1.9;opacity:.55}
+  #rare{
+    top:max(18px,env(safe-area-inset-top));right:max(20px,env(safe-area-inset-right));
+    color:#ffd98a;text-shadow:0 0 18px rgba(255,217,138,.7);opacity:0;transition:opacity .6s ease;
+  }
+  #rare.on{opacity:.95;transition:opacity .12s ease}
+
+  /* ——— entry ——— */
+  #gate{
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    flex-direction:column;gap:26px;background:#04060f;z-index:9;cursor:pointer;
+    transition:opacity 1.6s ease;
+  }
+  #gate.gone{opacity:0;pointer-events:none}
+  #gate h1{
+    margin:0;font-weight:300;font-size:clamp(26px,6.2vw,54px);letter-spacing:.62em;
+    text-indent:.62em;color:#bff6ee;
+    animation:breathe 5.2s ease-in-out infinite;
+  }
+  #gate p{margin:0;font-size:10px;letter-spacing:.34em;color:rgba(127,233,221,.3);text-transform:uppercase}
+  @keyframes breathe{
+    0%,100%{opacity:.4;text-shadow:0 0 26px rgba(95,245,230,.18)}
+    50%    {opacity:1; text-shadow:0 0 60px rgba(95,245,230,.6),0 0 120px rgba(139,108,255,.28)}
+  }
+
+  /* ——— keymap ——— */
+  #keys{
+    position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:8;
+    background:rgba(4,6,15,.86);backdrop-filter:blur(6px);
+  }
+  #keys.on{display:flex}
+  #keys table{border-collapse:collapse;font-size:11px;letter-spacing:.16em}
+  #keys td{padding:7px 22px 7px 0;color:rgba(127,233,221,.62);text-transform:uppercase}
+  #keys td:first-child{color:#ffd98a;text-align:right;padding-right:26px}
+  @media (prefers-reduced-motion: reduce){
+    #gate h1{animation-duration:9s}
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div id="gate">
+  <h1>DESCEND</h1>
+  <p>click to begin</p>
+</div>
+
+<div id="ui">
+  <div class="corner" id="phase"><b>—</b><i></i></div>
+  <div class="corner" id="rare">◈ RARE</div>
+  <div class="corner" id="meta"></div>
+  <div class="corner" id="hint">? keys</div>
+</div>
+
+<div id="keys">
+  <table>
+    <tr><td>space</td><td>pause / resume</td></tr>
+    <tr><td>m</td><td>mute</td></tr>
+    <tr><td>r</td><td>reseed</td></tr>
+    <tr><td>1 – 4</td><td>jump to phase</td></tr>
+    <tr><td>← →</td><td>tempo ∓ 4 bpm</td></tr>
+    <tr><td>v</td><td>vertical 9:16</td></tr>
+    <tr><td>f</td><td>fullscreen</td></tr>
+    <tr><td>h</td><td>hide interface</td></tr>
+    <tr><td>?</td><td>close</td></tr>
+  </table>
+</div>
+
+<script>
+"use strict";
+/* ════════════════════════════════════════════════════════════════════════════
+   ABYSSAL — a generative synth-arpeggio machine with a piano visualizer.
+   One file. No dependencies. No network. No samples.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* ——————————————————————————————————————————————————————————————————————————
+   SEED + RNG          every random decision routes through here, so ?seed=
+   reproduces a run exactly.
+   —————————————————————————————————————————————————————————————————————————— */
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function seedFromString(s){
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+let SEED = (new URLSearchParams(location.search).get('seed') || '').trim();
+if (!SEED) SEED = (Math.random() * 0xFFFFFF | 0).toString(36).toUpperCase().padStart(4,'0');
+let rng = mulberry32(seedFromString(SEED));
+
+const rnd   = () => rng();
+const rr    = (a,b) => a + rng() * (b - a);
+const ri    = (a,b) => Math.floor(a + rng() * (b - a + 1));
+const pick  = arr => arr[Math.floor(rng() * arr.length)];
+const chance= p => rng() < p;
+/** weighted pick from {key: weight} — returns key as a number */
+function wpick(table){
+  let total = 0; for (const k in table) total += table[k];
+  let r = rng() * total;
+  for (const k in table){ r -= table[k]; if (r <= 0) return +k; }
+  return +Object.keys(table)[0];
+}
+const clamp = (v,a,b) => v < a ? a : v > b ? b : v;
+const lerp  = (a,b,t) => a + (b - a) * t;
+const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+const easeInOutSine = t => -(Math.cos(Math.PI * t) - 1) / 2;
+const TAU = Math.PI * 2;
+
+/* ——————————————————————————————————————————————————————————————————————————
+   THEORY
+   Modes are pitch-class sets. Everything downstream thinks in *scale steps*,
+   never semitones, so a modulation costs one table swap and nothing else.
+   —————————————————————————————————————————————————————————————————————————— */
+const MODES = {
+  dorian:      [0,2,3,5,7,9,10],   // home. the raised 6th is the whole point.
+  aeolian:     [0,2,3,5,7,8,10],   // darker
+  phrygianDom: [0,1,4,5,7,8,10],   // ritual / occult
+  lydian:      [0,2,4,6,7,9,11]    // the lift
+};
+
+/** pitch of a scale step, where step may be any integer (negative or > 7) */
+function scalePitch(tonic, mode, step){
+  const s = MODES[mode];
+  const oct = Math.floor(step / 7);
+  const idx = ((step % 7) + 7) % 7;
+  return tonic + 12 * oct + s[idx];
+}
+
+/* Voicings are scale-step offsets from the chord root.
+   0=root 1=2nd 2=3rd 3=4th 4=5th 5=6th 6=7th 7=8ve 8=9th 9=10th 10=11th 11=12th
+   Note what is absent: nothing here is a plain triad. */
+const VOICINGS = {
+  m11:      [0,4,6,8,10],      // root 5 7 9 11
+  add9:     [0,2,4,8],
+  sus2:     [0,1,4,8],
+  sus4:     [0,3,4,7],
+  maj7s11:  [0,2,4,6,10],      // the #11 arrives free in lydian
+  m69:      [0,2,4,5,8],
+  quartal:  [0,3,6,9],         // stacked 4ths
+  quartal2: [0,3,6,8]
+};
+const VOICING_KEYS = Object.keys(VOICINGS);
+
+/* Markov table over scale degrees (0 = tonic). Weighted toward the two moves
+   this piece is built on: i → ♭VII → IV → i, and the plagal descent iv → i. */
+const PROG = {
+  0: {6:0.28, 4:0.19, 3:0.19, 5:0.14, 2:0.14, 1:0.06},
+  1: {0:0.50, 3:0.30, 6:0.20},
+  2: {3:0.50, 6:0.30, 0:0.20},
+  3: {0:0.48, 4:0.27, 6:0.20, 1:0.05},
+  4: {2:0.40, 0:0.38, 3:0.22},
+  5: {0:0.40, 3:0.32, 6:0.28},
+  6: {3:0.50, 0:0.30, 2:0.20}
+};
+
+/** Degrees that actually carry tension. ♭VII (6) is the warm one this piece leans
+    on hardest — marking it tense turned the whole palette coral. The supertonic is
+    always tense; the dominant only sometimes, so the colour stays an event. */
+const TENSE_DEGREES = new Set([1, 4]);
+
+/**
+ * Voice leading. Hold common tones; move everything else by the smallest
+ * available interval. This single function is the difference between
+ * "beautiful" and "a list of correct notes".
+ */
+function voiceLead(prev, tones, lo, hi){
+  if (!prev || !prev.length){
+    return tones.map(t => {
+      while (t < lo) t += 12;
+      while (t > hi) t -= 12;
+      return t;
+    }).sort((a,b) => a - b);
+  }
+  const out = [];
+  for (const tone of tones){
+    let best = null, bestDist = Infinity;
+    for (let o = -3; o <= 3; o++){
+      const cand = tone + 12 * o;
+      if (cand < lo || cand > hi) continue;
+      let d = Infinity;
+      for (const p of prev) d = Math.min(d, Math.abs(cand - p));
+      // tiny penalty for doubling a pitch already in the voicing
+      if (out.indexOf(cand) >= 0) d += 6;
+      if (d < bestDist){ bestDist = d; best = cand; }
+    }
+    if (best === null){
+      best = clamp(tone, lo, hi);
+    }
+    out.push(best);
+  }
+  // dedupe, keep sorted
+  const uniq = [...new Set(out)].sort((a,b) => a - b);
+  return uniq;
+}
+
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+const pc   = m => ((m % 12) + 12) % 12;
+
+/* ——————————————————————————————————————————————————————————————————————————
+   AUDIO ENGINE
+   voice ─┬─ dry ───────────────────────────┐
+          ├─ delaySend → pingPong ──────────┤→ bus → saturate → pump → limiter → out
+          └─ verbSend  → convolver ─────────┘
+   —————————————————————————————————————————————————————————————————————————— */
+const Audio = {
+  ctx: null, ready: false,
+  bus: null, master: null, pump: null,
+  dSend: null, vSend: null,
+  padOsc: [], padGain: null, padFilter: null
+};
+
+function buildAudio(){
+  const ctx = Audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+  // —— master chain, built back to front ——
+  const master = ctx.createGain();
+  master.gain.value = 0.0;                       // faded in by the intro
+  master.connect(ctx.destination);
+
+  // limiter: brick-ish, so nothing ever clips no matter how dense it gets
+  const limiter = ctx.createDynamicsCompressor();
+  limiter.threshold.value = -6;
+  limiter.knee.value      = 0;
+  limiter.ratio.value     = 20;
+  limiter.attack.value    = 0.002;
+  limiter.release.value   = 0.18;
+  limiter.connect(master);
+
+  // sidechain pump — the thing that makes it sound produced rather than demoed
+  const pump = ctx.createGain();
+  pump.gain.value = 1;
+  pump.connect(limiter);
+
+  // gentle tanh saturation
+  const sat = ctx.createWaveShaper();
+  {
+    const n = 2048, c = new Float32Array(n);
+    for (let i = 0; i < n; i++){
+      const x = (i / (n - 1)) * 2 - 1;
+      c[i] = Math.tanh(x * 1.8) / Math.tanh(1.8);
+    }
+    sat.curve = c; sat.oversample = '2x';
+  }
+  sat.connect(pump);
+
+  const bus = ctx.createGain();
+  bus.gain.value = 0.9;
+  bus.connect(sat);
+
+  // —— ping-pong delay, dotted 8th, lowpassed feedback ——
+  const dSend = ctx.createGain(); dSend.gain.value = 1;
+  const dL = ctx.createDelay(2), dR = ctx.createDelay(2);
+  const fb = ctx.createGain(); fb.gain.value = 0.38;
+  const fbLP = ctx.createBiquadFilter(); fbLP.type = 'lowpass'; fbLP.frequency.value = 2500;
+  const merge = ctx.createChannelMerger(2);
+  const dWet = ctx.createGain(); dWet.gain.value = 0.30;
+  dSend.connect(dL);
+  dL.connect(dR); dR.connect(fbLP); fbLP.connect(fb); fb.connect(dL);   // cross-fed
+  dL.connect(merge, 0, 0);
+  dR.connect(merge, 0, 1);
+  merge.connect(dWet); dWet.connect(bus);
+
+  // —— procedural convolution reverb: filtered, exponentially decaying noise ——
+  const vSend = ctx.createGain(); vSend.gain.value = 1;
+  const conv  = ctx.createConvolver();
+  conv.buffer = makeImpulse(ctx, 3.5, 2.6);
+  const vWet  = ctx.createGain(); vWet.gain.value = 0.42;
+  const vLP   = ctx.createBiquadFilter(); vLP.type = 'lowpass'; vLP.frequency.value = 4200;
+  vSend.connect(vLP); vLP.connect(conv); conv.connect(vWet); vWet.connect(bus);
+
+  // —— the trench drone: 3 detuned saws under a very slow filter LFO ——
+  const padGain = ctx.createGain(); padGain.gain.value = 0.0;
+  const padFilter = ctx.createBiquadFilter();
+  padFilter.type = 'lowpass'; padFilter.frequency.value = 420; padFilter.Q.value = 4;
+  padGain.connect(padFilter);
+  padFilter.connect(bus);
+  padFilter.connect(vSend);
+
+  const lfo = ctx.createOscillator(); lfo.frequency.value = 0.07;
+  const lfoAmt = ctx.createGain(); lfoAmt.gain.value = 260;
+  lfo.connect(lfoAmt); lfoAmt.connect(padFilter.frequency); lfo.start();
+
+  // each detuned saw gets its own place in the image — stacking them in the centre
+  // is what makes a super-saw sound narrow
+  const padOsc = [];
+  [[-7, -0.68], [0, 0], [7, 0.68]].forEach((spec, i) => {
+    const o = ctx.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.value = mtof(38);
+    o.detune.value = spec[0];
+    const g = ctx.createGain(); g.gain.value = i === 1 ? 0.30 : 0.24;
+    o.connect(g);
+    if (ctx.createStereoPanner){
+      const pan = ctx.createStereoPanner(); pan.pan.value = spec[1];
+      g.connect(pan); pan.connect(padGain);
+    } else g.connect(padGain);
+    o.start();
+    padOsc.push(o);
+  });
+
+  Object.assign(Audio, {
+    bus, master, pump, dSend, vSend, dWet, vWet, fb, limiter, dL, dR,
+    padOsc, padGain, padFilter, ready: true
+  });
+}
+
+/** dotted-8th ping-pong, retimed whenever the tempo changes */
+function setDelayTime(bpm){
+  if (!Audio.dL) return;
+  const t = Audio.ctx.currentTime;
+  const dotted = (60 / bpm) * 0.75;
+  Audio.dL.delayTime.setTargetAtTime(dotted, t, 0.25);
+  Audio.dR.delayTime.setTargetAtTime(dotted, t, 0.25);
+}
+
+/** Impulse response generated in code: decaying filtered noise, stereo-decorrelated. */
+function makeImpulse(ctx, seconds, decay){
+  const sr  = ctx.sampleRate;
+  const len = Math.floor(sr * seconds);
+  const buf = ctx.createBuffer(2, len, sr);
+  for (let ch = 0; ch < 2; ch++){
+    const d = buf.getChannelData(ch);
+    let lp = 0;
+    // a hair of pre-delay difference per channel is what opens the stereo image
+    const pre = ch === 0 ? 0 : Math.floor(sr * 0.011);
+    for (let i = 0; i < len; i++){
+      const t = i / len;
+      const env = Math.pow(1 - t, decay);
+      const n = (rng() * 2 - 1) * env;
+      lp += (n - lp) * 0.34;                        // one-pole lowpass, dark tail
+      d[i + pre < len ? i + pre : i] = lp * (1 - t * 0.15);
+    }
+    // soften the very front so it blooms instead of cracks
+    for (let i = 0; i < 400 && i < len; i++) d[i] *= i / 400;
+  }
+  return buf;
+}
+
+/** white noise tile reused by the Karplus-Strong excitation */
+function noiseSeed(n){
+  const a = new Float32Array(n);
+  for (let i = 0; i < n; i++) a[i] = rng() * 2 - 1;
+  return a;
+}
+
+/* ——— VOICE 1: 2-op FM electric piano. carrier sine, modulator at 14:1 with a
+   fast-decaying index — bell attack, woody body. Plus a sine sub an octave down. */
+function fmKeys(t, midi, vel, dur, bright){
+  const ctx = Audio.ctx;
+  const f = mtof(midi);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vel * 0.30), t + 0.004);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vel * 0.11), t + 0.13);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.35);
+
+  const car = ctx.createOscillator();
+  car.type = 'sine'; car.frequency.value = f;
+
+  const mod = ctx.createOscillator();
+  mod.type = 'sine'; mod.frequency.value = f * 14;
+  const mg = ctx.createGain();
+  const idx = f * (1.4 + bright * 1.8) * (0.45 + vel * 0.75);
+  mg.gain.setValueAtTime(idx, t);
+  mg.gain.exponentialRampToValueAtTime(Math.max(1, idx * 0.02), t + 0.12);
+  mod.connect(mg); mg.connect(car.frequency);
+
+  const sub = ctx.createOscillator();
+  sub.type = 'sine'; sub.frequency.value = f / 2;
+  const sg = ctx.createGain(); sg.gain.value = 0.24;
+  sub.connect(sg); sg.connect(g);
+
+  const tone = ctx.createBiquadFilter();
+  tone.type = 'lowpass';
+  tone.frequency.value = clamp(f * 7 + 900, 700, 11000);
+  tone.Q.value = 0.4;
+
+  car.connect(g); g.connect(tone);
+  const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+  const out = pan || ctx.createGain();
+  tone.connect(out);
+  if (pan) pan.pan.value = clamp((midi - 70) / 24 + rr(-0.06, 0.06), -0.82, 0.82);
+
+  out.connect(Audio.bus);
+  const ds = ctx.createGain(); ds.gain.value = 0.42; out.connect(ds); ds.connect(Audio.dSend);
+  const vs = ctx.createGain(); vs.gain.value = 0.50; out.connect(vs); vs.connect(Audio.vSend);
+
+  const stop = t + dur + 0.5;
+  car.start(t); mod.start(t); sub.start(t);
+  car.stop(stop); mod.stop(stop); sub.stop(stop);
+  car.onended = () => { try{ out.disconnect(); ds.disconnect(); vs.disconnect(); }catch(e){} };
+}
+
+/* ——— VOICE 2: Karplus-Strong pluck, rendered offline into a buffer.
+   Doing the string in JS rather than as a feedback graph keeps it deterministic
+   and costs nothing at these note densities. */
+function ksPluck(t, midi, vel, dur, reverse){
+  const ctx = Audio.ctx, sr = ctx.sampleRate;
+  const f = mtof(midi);
+  const N = Math.max(2, Math.round(sr / f));
+  const len = Math.min(Math.floor(sr * (dur + 0.6)), Math.floor(sr * 1.8));
+  const buf = ctx.createBuffer(1, len, sr);
+  const d = buf.getChannelData(0);
+  const line = noiseSeed(N);
+  // soften the excitation so it reads as water, not as a snap
+  for (let i = 1; i < N; i++) line[i] = line[i] * 0.5 + line[i-1] * 0.5;
+  const damp = 0.5 - clamp((midi - 60) / 260, 0, 0.12);
+  let idx = 0, prev = 0;
+  for (let i = 0; i < len; i++){
+    const cur = line[idx];
+    const nx  = line[(idx + 1) % N];
+    const avg = (cur * damp + nx * (1 - damp)) * 0.9965;
+    line[idx] = avg;
+    idx = (idx + 1) % N;
+    prev = prev * 0.06 + cur * 0.94;
+    d[i] = prev * Math.exp(-i / (sr * (0.35 + dur * 0.5)));
+  }
+  if (reverse){
+    // a genuinely reversed string — swells in instead of decaying out
+    for (let i = 0, j = len - 1; i < j; i++, j--){ const tmp = d[i]; d[i] = d[j]; d[j] = tmp; }
+  }
+  const src = ctx.createBufferSource(); src.buffer = buf;
+  const g = ctx.createGain(); g.gain.value = vel * (reverse ? 0.34 : 0.26);
+  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 240;
+  const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+  const out = pan || ctx.createGain();
+  if (pan) pan.pan.value = clamp((midi - 70) / 26 + rr(-0.18, 0.18), -0.85, 0.85);
+  src.connect(g); g.connect(hp); hp.connect(out);
+  out.connect(Audio.bus);
+  const ds = ctx.createGain(); ds.gain.value = 0.6; out.connect(ds); ds.connect(Audio.dSend);
+  const vs = ctx.createGain(); vs.gain.value = 0.7; out.connect(vs); vs.connect(Audio.vSend);
+  src.start(t);
+  src.onended = () => { try{ out.disconnect(); ds.disconnect(); vs.disconnect(); }catch(e){} };
+}
+
+/* ——— VOICE 3: sine sub bass, slow attack, sits under everything ——— */
+function subBass(t, midi, vel, dur){
+  const ctx = Audio.ctx;
+  const o = ctx.createOscillator();
+  o.type = 'sine'; o.frequency.setValueAtTime(mtof(midi), t);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vel * 0.42), t + 0.08);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 190;
+  o.connect(g); g.connect(lp); lp.connect(Audio.bus);
+  const vs = ctx.createGain(); vs.gain.value = 0.12; lp.connect(vs); vs.connect(Audio.vSend);
+  o.start(t); o.stop(t + dur + 0.1);
+  o.onended = () => { try{ lp.disconnect(); vs.disconnect(); }catch(e){} };
+}
+
+/** retune the drone to a new chord root, with portamento */
+function padTo(midi, t){
+  if (!Audio.padOsc.length) return;
+  const f = mtof(midi);
+  Audio.padOsc.forEach(o => {
+    o.frequency.cancelScheduledValues(t);
+    o.frequency.setValueAtTime(o.frequency.value, t);
+    o.frequency.exponentialRampToValueAtTime(f, t + 1.4);
+  });
+}
+
+/** the pump: a dip on beats 1 and 3 with a 180ms recovery */
+function schedulePump(t, depth){
+  const g = Audio.pump.gain;
+  g.cancelScheduledValues(t);
+  g.setValueAtTime(1, t);
+  g.linearRampToValueAtTime(1 - depth, t + 0.012);
+  g.linearRampToValueAtTime(1, t + 0.19);
+}
+
+/* ——————————————————————————————————————————————————————————————————————————
+   THE ARRANGER
+   36 bars @ 96bpm = 90.0s, and the cycle returns to the same key, the same
+   camera position and the same density — so one cycle of screen recording
+   loops seamlessly.
+   —————————————————————————————————————————————————————————————————————————— */
+const PHASES = [
+  { name:'DRIFT',   bars: 8,  mode:'dorian',  tonic:50, density:0.38, runP:0.00,
+    counter:0.30, lo:55, hi:84, pad:0.055, delay:0.20, verb:0.50, bright:0.35, lvl:0.70 },
+  { name:'BLOOM',   bars:10,  mode:'dorian',  tonic:50, density:0.86, runP:0.50,
+    counter:0.70, lo:55, hi:88, pad:0.070, delay:0.34, verb:0.42, bright:0.62, lvl:1.00 },
+  { name:'DESCENT', bars:10,  mode:'aeolian', tonic:50, density:0.62, runP:0.18,
+    counter:0.50, lo:45, hi:79, pad:0.105, delay:0.30, verb:0.55, bright:0.22, lvl:0.82 },
+  { name:'SURFACE', bars: 8,  mode:'lydian',  tonic:53, density:0.90, runP:0.80,
+    counter:0.80, lo:57, hi:91, pad:0.060, delay:0.42, verb:0.48, bright:0.95, lvl:1.00 }
+];
+const CYCLE_BARS = PHASES.reduce((a,p) => a + p.bars, 0);   // 36
+const PHASE_START = (() => { let a = 0; return PHASES.map(p => { const s = a; a += p.bars; return s; }); })();
+
+const PATTERNS = ['up','down','upDown','downUp','outsideIn','pedal','walk'];
+
+const M = {
+  bpm: 96,
+  swing: 0.56,
+  step: 0,                 // global 16th counter
+  nextTime: 0,
+  degree: 0,
+  voicing: [],
+  pool: [],
+  pattern: 'up',
+  patIdx: 0,
+  walkPos: 0,
+  phaseIdx: 0,
+  phase: PHASES[0],
+  chordId: 0,
+  curMode: 'dorian',
+  tension: 0,
+  descentDark: false,
+  // one-shot state
+  silenceUntil: -1,
+  bigChordAt: -1,
+  leviathanUntil: -1,
+  cascade: null,
+  lastRareBar: -99,
+  nextSilBar: 6,
+  started: false,
+  muted: false,
+  paused: false
+};
+
+const visualQueue = [];
+const FX = { pulse: 0, bassShock: 0, whiteout: 0, constellation: 0, leviathanQ: 0, sigilQueue: null, silQueue: null };
+
+function stepDur(){ return 60 / M.bpm / 4; }
+function barOf(step){ return Math.floor(step / 16); }
+function cyclePos(){                                  // 0..1 through the 90s arc
+  const b = barOf(M.step) % CYCLE_BARS;
+  return (b * 16 + (M.step % 16)) / (CYCLE_BARS * 16);
+}
+
+function phaseForBar(bar){
+  const b = bar % CYCLE_BARS;
+  for (let i = PHASES.length - 1; i >= 0; i--) if (b >= PHASE_START[i]) return i;
+  return 0;
+}
+
+/** pick the next chord, then voice-lead into it */
+function nextChord(){
+  const barInCycle = barOf(M.step) % CYCLE_BARS;
+  const atPhaseHead = PHASE_START.indexOf(barInCycle) >= 0;
+  // every progression resolves home at a phase boundary — the loop has to land
+  M.degree = atPhaseHead ? 0 : wpick(PROG[M.degree] || PROG[0]);
+
+  const p = M.phase;
+  const mode = (p.name === 'DESCENT' && M.descentDark) ? 'phrygianDom' : p.mode;
+  let tmplKey;
+  if (p.name === 'SURFACE')      tmplKey = chance(0.5) ? 'maj7s11' : (chance(0.5) ? 'add9' : 'm69');
+  else if (p.name === 'DESCENT') tmplKey = chance(0.45) ? 'quartal' : (chance(0.5) ? 'm11' : 'sus4');
+  else                           tmplKey = pick(VOICING_KEYS);
+
+  const tmpl = VOICINGS[tmplKey];
+  const tones = tmpl.map(o => scalePitch(p.tonic, mode, M.degree + o));
+  M.curMode = mode;
+  M.voicing = voiceLead(M.voicing, tones, p.lo, p.hi);
+  M.tension = TENSE_DEGREES.has(M.degree) ? (M.degree === 1 || chance(0.45) ? 1 : 0) : 0;
+  M.chordId++;
+
+  // arp pool: the voicing, plus an octave up, clipped to the phase register
+  const pool = [];
+  for (const v of M.voicing){
+    pool.push(v);
+    if (v + 12 <= p.hi) pool.push(v + 12);
+    if (v - 12 >= p.lo && chance(0.35)) pool.push(v - 12);
+  }
+  M.pool = [...new Set(pool)].sort((a,b) => a - b);
+  M.patIdx = 0;
+  M.walkPos = Math.floor(M.pool.length / 2);
+  return { mode, root: scalePitch(p.tonic, mode, M.degree) };
+}
+
+/** the arpeggiator's note choice for a given position in the pattern */
+function arpNote(){
+  const n = M.pool.length;
+  if (!n) return 60;
+  let idx;
+  switch (M.pattern){
+    case 'up':    idx = M.patIdx % n; break;
+    case 'down':  idx = n - 1 - (M.patIdx % n); break;
+    case 'upDown': {
+      const period = Math.max(1, n * 2 - 2);
+      const k = M.patIdx % period;
+      idx = k < n ? k : period - k;
+      break;
+    }
+    case 'downUp': {
+      const period = Math.max(1, n * 2 - 2);
+      const k = M.patIdx % period;
+      idx = k < n ? n - 1 - k : k - n + 1;
+      break;
+    }
+    case 'outsideIn': {
+      const k = M.patIdx % n;
+      idx = k % 2 === 0 ? Math.floor(k / 2) : n - 1 - Math.floor(k / 2);
+      break;
+    }
+    case 'pedal':
+      // top note held as a pedal while the lower voices move beneath it
+      idx = (M.patIdx % 2 === 1) ? n - 1 : (Math.floor(M.patIdx / 2) % Math.max(1, n - 1));
+      break;
+    case 'walk':
+    default: {
+      // random walk with gravity back toward the centre of the register
+      const centre = (n - 1) / 2;
+      const drift = (centre - M.walkPos) * 0.28;
+      M.walkPos = clamp(Math.round(M.walkPos + drift + (rng() < 0.5 ? -1 : 1) * ri(1, 2)), 0, n - 1);
+      idx = M.walkPos;
+      break;
+    }
+  }
+  M.patIdx++;
+  return M.pool[clamp(idx, 0, n - 1)];
+}
+
+/** every sound in the piece goes through here, and so does every photon */
+function emit(time, midi, vel, dur, voice){
+  if (M.muted) vel = 0;
+  const ev = { time, midi, vel, dur, voice, tension: M.tension, chordId: M.chordId, phase: M.phaseIdx };
+  if (vel > 0.002){
+    switch (voice){
+      case 'keys':   fmKeys(time, midi, vel, dur, M.phase.bright); break;
+      case 'pluck':  ksPluck(time, midi, vel, dur, false); break;
+      case 'rpluck': ksPluck(time, midi, vel, dur, true); break;
+      case 'sub':    subBass(time, midi, vel, dur); break;
+    }
+  }
+  // The queue MUST stay time-ordered: runs, hook cells and cascades emit notes
+  // ahead of the step cursor, so a naive push puts a far-future event at the head
+  // and blocks every nearer note behind it. Nearly-sorted, so this is O(1) in practice.
+  let i = visualQueue.length;
+  while (i > 0 && visualQueue[i-1].time > time) i--;
+  visualQueue.splice(i, 0, ev);
+}
+
+/* ——— rare events: the reason somebody watches for three minutes ——— */
+function maybeRare(bar, time){
+  if (bar - M.lastRareBar < 12) return;                 // ≈30s floor
+  if (!chance(0.22)) return;
+  M.lastRareBar = bar;
+  const kind = pick(['leviathan','cascade','constellation','whiteout']);
+  showRare(kind);
+
+  if (kind === 'leviathan'){
+    M.leviathanUntil = M.step + 16 * 4;
+    FX.leviathanQ = 1;
+  } else if (kind === 'cascade'){
+    const fib = [1,1,2,3,5,8,13,21];
+    const note = M.pool.length ? M.pool[Math.floor(M.pool.length * 0.7)] : 72;
+    let acc = 0;
+    for (let i = 0; i < fib.length; i++){
+      acc += fib[i];
+      emit(time + acc * stepDur(), note + (i % 2 ? 12 : 0), 0.55 * Math.pow(0.82, i), 0.5, 'pluck');
+    }
+  } else if (kind === 'constellation'){
+    FX.constellation = 1;
+    M.voicing.forEach((v, i) => emit(time + i * 0.09, v + 24, 0.10, 2.4, 'pluck'));
+  } else if (kind === 'whiteout'){
+    M.silenceUntil = M.step + 8;                        // two beats of nothing
+    M.bigChordAt   = M.step + 8;
+  }
+}
+
+/* ——— the step scheduler ——— */
+function scheduleStep(){
+  const t    = M.nextTime + ((M.step % 2) ? (M.swing - 0.5) * 2 * stepDur() : 0);
+  const s16  = M.step % 16;
+  const bar  = barOf(M.step);
+  const sd   = stepDur();
+
+  // —— bar boundary ——
+  if (s16 === 0){
+    const pi = phaseForBar(bar);
+    if (pi !== M.phaseIdx){
+      M.phaseIdx = pi;
+      M.phase = PHASES[pi];
+      if (pi === 2) M.descentDark = chance(0.5);
+      applyPhaseMix(t);
+    }
+    if (bar % 2 === 0 || chance(0.25)){
+      const c = nextChord();
+      padTo(c.root - 12, t);
+      FX.sigilQueue = { n: Math.max(3, M.voicing.length), tension: M.tension, at: t };
+      emit(t, c.root - 12, 0.55 + rng() * 0.2, sd * 16 * (chance(0.4) ? 2 : 1), 'sub');
+    }
+    if (bar % 2 === 0) M.pattern = pick(PATTERNS);
+    if (bar >= M.nextSilBar){                  // something passes every 40-90s
+      M.nextSilBar = bar + ri(16, 36);
+      FX.silQueue = pick(SIL_KINDS);
+    }
+    maybeRare(bar, t);
+  }
+
+  // —— pump on beats 1 and 3 ——
+  if (s16 === 0 || s16 === 8) schedulePump(t, M.phaseIdx === 2 ? 0.13 : 0.18);
+
+  const inSilence  = M.step < M.silenceUntil;
+  const leviathan  = M.step < M.leviathanUntil;
+
+  // —— the fortissimo chord after the whiteout ——
+  if (M.step === M.bigChordAt){
+    M.bigChordAt = -1;
+    FX.whiteout = 1;
+    M.voicing.forEach((v, i) => emit(t + i * 0.012, v, 0.95, 2.6, 'keys'));
+    emit(t, M.voicing[0] - 24, 1.0, 3.0, 'sub');
+  }
+  if (inSilence){ advance(); return; }
+
+  // —— rests: a full beat of silence before roughly every 4th phrase ——
+  const phraseIdx = Math.floor(bar / 4);
+  const restBeat = (phraseIdx % 4 === 3) && (bar % 4 === 3) && s16 >= 12;
+  if (restBeat){ advance(); return; }
+
+  const p = M.phase;
+
+  // —— the hook cell: minor 3rd up, then perfect 4th up. the signature. ——
+  if (s16 === 0 && bar % 4 === 0 && chance(0.55) && M.pool.length){
+    const base = M.pool[clamp(Math.floor(M.pool.length * rr(0.25, 0.6)), 0, M.pool.length - 1)];
+    [[0, 0.92], [3, 0.80], [8, 1.0]].forEach((pair, i) => {
+      emit(t + i * sd * 2, base + pair[0], pair[1] * rr(0.72, 0.88), sd * 3.2, 'keys');
+    });
+    M.patIdx += 3;
+    advance(); return;
+  }
+
+  // —— the opening leap: a perfect 5th or a major 9th up at the top of a phrase.
+  //     open intervals at phrase starts are what make a line sound hopeful. ——
+  if (s16 === 0 && bar % 4 === 0 && M.pool.length && chance(0.5)){
+    const base = M.pool[clamp(Math.floor(M.pool.length * rr(0.05, 0.40)), 0, M.pool.length - 1)];
+    const leap = chance(0.55) ? 7 : 14;
+    emit(t, base, rr(0.60, 0.76), sd * 2.6, 'keys');
+    emit(t + sd * 2, base + leap, rr(0.80, 0.95), sd * 3.6, 'keys');
+    M.patIdx += 2;
+    advance(); return;
+  }
+
+  // —— 4–3 suspension landing on the downbeat. the oldest trick there is. ——
+  if (s16 === 14 && bar % 2 === 0 && chance(0.5) && M.voicing.length){
+    const four  = scalePitch(p.tonic, M.curMode, M.degree + 3);
+    const three = scalePitch(p.tonic, M.curMode, M.degree + 2);
+    const centre = M.voicing[Math.floor(M.voicing.length / 2)];
+    let f4 = four;
+    while (f4 < centre - 6) f4 += 12;
+    while (f4 > centre + 6) f4 -= 12;
+    emit(t, f4, rr(0.55, 0.68), sd * 2.4, 'keys');
+    emit(t + sd * 2, f4 - (four - three), rr(0.78, 0.92), sd * 5, 'keys');
+    M.patIdx++;
+    advance(); return;
+  }
+
+  // —— the tritone, expanding outward a semitone on each side into a 6th.
+  //     reserved for the tension chords, which is where the release is earned. ——
+  if (s16 === 8 && M.tension && chance(0.5) && M.voicing.length >= 2){
+    const centre = M.voicing[Math.floor(M.voicing.length / 2)];
+    const lo = centre - 3, hi = lo + 6;
+    emit(t, lo, rr(0.52, 0.64), sd * 2, 'keys');
+    emit(t + 0.006, hi, rr(0.54, 0.66), sd * 2, 'keys');
+    emit(t + sd * 2, lo - 1, rr(0.74, 0.88), sd * 5, 'keys');
+    emit(t + sd * 2 + 0.006, hi + 1, rr(0.76, 0.90), sd * 5, 'keys');
+    M.patIdx += 2;
+    advance(); return;
+  }
+
+  // —— 32nd-note run: two octaves up, landing on a chord tone ——
+  if (s16 === 12 && chance(p.runP * 0.35) && M.pool.length > 2){
+    const count = ri(6, 11);
+    const start = M.pool[0];
+    for (let i = 0; i < count; i++){
+      const frac = i / (count - 1);
+      const target = start + Math.round(frac * 24);
+      // snap every note of the run to the chord
+      let best = M.pool[0], bd = 99;
+      for (const c of M.pool.concat(M.pool.map(x => x + 12))){
+        const d = Math.abs(c - target);
+        if (d < bd){ bd = d; best = c; }
+      }
+      emit(t + i * sd * 0.5, best, rr(0.42, 0.62) + frac * 0.3, sd * 1.4, 'keys');
+    }
+    advance(); return;
+  }
+
+  // —— the arpeggio itself ——
+  const onBeat   = s16 % 4 === 0;
+  const offEighth= s16 % 2 === 0;
+  let prob = p.density * (onBeat ? 1.25 : offEighth ? 1.0 : 0.62);
+  if (leviathan) prob *= 0.8;
+  if (chance(prob)){
+    const pos = s16 / 16;
+    const contour = 0.70 + 0.34 * Math.sin(pos * Math.PI * 0.92);   // crescendo into beat 3
+    const vel = clamp(contour * rr(0.85, 1.15) * (onBeat ? 1.08 : 0.92), 0.08, 1);
+    const jitter = rr(-0.008, 0.008);                                // ±8 ms of human
+    const midi = arpNote();
+    emit(t + jitter, midi, vel * 0.9, sd * rr(1.6, 3.4), leviathan ? 'rpluck' : 'keys');
+    // octave-displaced echo: same pitch class, jumped an octave. pure ear candy.
+    if (chance(0.10) && midi + 12 <= p.hi) emit(t + jitter + sd * 0.5, midi + 12, vel * 0.4, sd * 2, 'pluck');
+  }
+
+  // —— counter-melody: sparse, high, doubled a 5th below ——
+  if (s16 % 8 === 0 && chance(p.counter) && M.voicing.length){
+    const top = M.voicing[M.voicing.length - 1] + (chance(0.5) ? 12 : 7);
+    emit(t + rr(0, 0.02), Math.min(top, p.hi + 6), rr(0.4, 0.6), sd * 6, 'pluck');
+    if (chance(0.6)) emit(t + 0.02, Math.min(top, p.hi + 6) - 7, 0.22, sd * 5, 'pluck');
+  }
+
+  advance();
+}
+
+function advance(){
+  M.nextTime += stepDur();
+  M.step++;
+}
+
+/** phase changes move the mix, not just the notes */
+function applyPhaseMix(t){
+  const p = M.phase;
+  const k = 0.9;
+  Audio.bus.gain.setTargetAtTime(0.9 * p.lvl, t, k);
+  Audio.padGain.gain.setTargetAtTime(p.pad, t, k);
+  Audio.dWet.gain.setTargetAtTime(p.delay, t, k);
+  Audio.vWet.gain.setTargetAtTime(p.verb, t, k);
+  Audio.padFilter.frequency.setTargetAtTime(260 + p.bright * 900, t, k);
+  Audio.fb.gain.setTargetAtTime(0.30 + p.delay * 0.28, t, k);
+}
+
+let schedTimer = null;
+function schedulerTick(){
+  if (!Audio.ready || M.paused) return;
+  const ahead = Audio.ctx.currentTime + 0.1;
+  let guard = 0;
+  while (M.nextTime < ahead && guard++ < 80) scheduleStep();
+}
+
+/* ——————————————————————————————————————————————————————————————————————————
+   VISUALS
+   Canvas 2D + a quarter-res glow buffer. Bright geometry is drawn cheaply into
+   the buffer and composited back blurred and additive; that one trick is what
+   makes light in water look like light in water.
+   —————————————————————————————————————————————————————————————————————————— */
+const cvs = document.getElementById('stage');
+const ctx = cvs.getContext('2d', { alpha: false });
+const glowC = document.createElement('canvas');       // 1/4 res: bright geometry
+const glow  = glowC.getContext('2d');
+const midC  = document.createElement('canvas');       // 1/8 res: blur pass 1
+const bloomC= document.createElement('canvas');       // 1/16 res: blur pass 2
+const abRC  = document.createElement('canvas');       // tinted copies for aberration
+const abBC  = document.createElement('canvas');
+const bgC   = document.createElement('canvas');       // pre-rendered ground + vignette
+const vigC  = document.createElement('canvas');
+const grainC = document.createElement('canvas');
+
+let DPR = 1, VW = 0, VH = 0;
+let ASPECT = 'wide';                    // 'wide' 16:9 | 'tall' 9:16
+const stage = { x:0, y:0, w:0, h:0 };
+const REDUCED = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+let LOW = false;                        // set true if the device can't hold frame rate
+
+const KEY_LO = 36, KEY_HI = 96, KEY_N = KEY_HI - KEY_LO + 1;
+const keys = new Array(KEY_N);
+
+/* ——— pools (nothing is allocated inside the render loop) ——— */
+const MAXP = REDUCED ? 160 : 420;
+const parts = Array.from({length: MAXP}, () => ({a:false,x:0,y:0,vx:0,vy:0,l:0,ml:1,r:1,h:190,s:80,b:1}));
+let partHead = 0;
+const MAXS = 28;
+const shocks = Array.from({length: MAXS}, () => ({a:false,x:0,y:0,r:0,mr:1,l:0,ml:1,h:190,w:2}));
+let shockHead = 0;
+const MAXC = 80;
+const cols = Array.from({length: MAXC}, () => ({a:false,k:0,vel:0,l:0,ml:1,h:190,s:80,hgt:0}));
+let colHead = 0;
+const MAXSG = 6;
+const sigils = Array.from({length: MAXSG}, () => ({a:false,n:5,r:0,mr:1,rot:0,l:0,ml:1,h:190}));
+let sigilHead = 0;
+
+const SNOW_N = REDUCED ? 90 : 230;
+const snow = Array.from({length: SNOW_N}, () => ({ x:rnd(), y:rnd(), z:ri(0,2), r:rr(.4,1.9), p:rnd()*TAU, sp:rr(.02,.09) }));
+
+const silhouettes = [];
+const SIL_KINDS = ['leviathan','arch','monolith'];
+
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, LOW ? 1 : 2);
+  VW = Math.max(1, Math.floor(innerWidth  * DPR));
+  VH = Math.max(1, Math.floor(innerHeight * DPR));
+  cvs.width = VW; cvs.height = VH;
+  cvs.style.width = innerWidth + 'px';
+  cvs.style.height = innerHeight + 'px';
+
+  // letterbox a 16:9 or 9:16 stage inside the viewport — reflow, never crop
+  const target = ASPECT === 'tall' ? 9 / 16 : 16 / 9;
+  let w = VW, h = Math.round(VW / target);
+  if (h > VH){ h = VH; w = Math.round(VH * target); }
+  stage.w = w; stage.h = h;
+  stage.x = Math.round((VW - w) / 2);
+  stage.y = Math.round((VH - h) / 2);
+
+  glowC.width  = Math.max(1, Math.floor(w / 4));
+  glowC.height = Math.max(1, Math.floor(h / 4));
+  midC.width   = Math.max(1, Math.floor(w / 8));
+  midC.height  = Math.max(1, Math.floor(h / 8));
+  bloomC.width = abRC.width = abBC.width  = Math.max(1, Math.floor(w / 16));
+  bloomC.height= abRC.height= abBC.height = Math.max(1, Math.floor(h / 16));
+
+  layoutKeys();
+}
+
+/** the keyboard, bent into an arc — luminous glass slats, not white and black keys */
+function layoutKeys(){
+  const W = stage.w, H = stage.h;
+  const cx = W / 2, cy = H * (ASPECT === 'tall' ? 1.18 : 1.30);
+  const R  = (ASPECT === 'tall' ? H * 0.62 : H * 0.80);
+  const spread = (ASPECT === 'tall' ? 1.42 : 1.72);   // radians of arc
+  for (let i = 0; i < KEY_N; i++){
+    const f = KEY_N === 1 ? 0.5 : i / (KEY_N - 1);
+    const ang = -Math.PI / 2 + (f - 0.5) * spread;
+    keys[i] = {
+      ang,
+      x: cx + Math.cos(ang) * R,
+      y: cy + Math.sin(ang) * R,
+      nx: Math.cos(ang), ny: Math.sin(ang),
+      midi: KEY_LO + i,
+      glow: 0, hue: 190, sat: 80
+    };
+  }
+  stage.cx = cx; stage.cy = cy; stage.R = R;
+  stage.keyW = (spread * R) / KEY_N;
+}
+
+function buildGrain(){
+  grainC.width = 512; grainC.height = 512;         // fewer tiles = fewer full-screen draws
+  const g = grainC.getContext('2d');
+  const img = g.createImageData(512, 512);
+  for (let i = 0; i < img.data.length; i += 4){
+    const v = 128 + (rng() * 2 - 1) * 60;
+    img.data[i] = img.data[i+1] = img.data[i+2] = v;
+    img.data[i+3] = 26;
+  }
+  g.putImageData(img, 0, 0);
+}
+
+/* ——— colour: pitch class around the ring, phase shifts the whole palette ——— */
+function hueFor(midi, tension, phaseIdx){
+  let h = 168 + pc(midi) * 8;                       // cyan → ultraviolet
+  let s = 82;
+  if (phaseIdx === 2){ h = 248 + pc(midi) * 2.6; s = 64; }      // DESCENT: ultraviolet
+  if (phaseIdx === 3){ h = 36  + pc(midi) * 1.3; s = 92; }      // SURFACE: anglerfish gold
+  // lerping a hue number from cyan to coral passes through magenta, which reads
+  // as neon rather than blood — so tension jumps straight there.
+  if (tension)      { h = 352 + pc(midi) * 0.6;  s = 88; }      // blood coral
+  return { h, s };
+}
+
+/* ——— spawners ——— */
+function spawnNote(ev){
+  const k = clamp(ev.midi - KEY_LO, 0, KEY_N - 1);
+  const key = keys[k];
+  if (!key) return;
+  const col = hueFor(ev.midi, ev.tension, ev.phase);
+  key.glow = Math.max(key.glow, clamp(ev.vel * 1.15, 0, 1.3));
+  key.hue = col.h; key.sat = col.s;
+
+  const c = cols[colHead = (colHead + 1) % MAXC];
+  c.a = true; c.k = k; c.vel = ev.vel; c.l = 0;
+  c.ml = 0.90 + ev.dur * 2.2 + ev.vel * 0.8;
+  c.h = col.h; c.s = col.s;
+  c.hgt = stage.h * (0.06 + ev.vel * 0.30) * (ev.voice === 'sub' ? 0.35 : 1);
+
+  const s = shocks[shockHead = (shockHead + 1) % MAXS];
+  s.a = true; s.x = key.x; s.y = key.y; s.r = 2; s.l = 0;
+  s.ml = 0.5 + ev.vel * 0.6; s.mr = stage.h * (0.05 + ev.vel * 0.16);
+  s.h = col.h; s.w = 1 + ev.vel * 2.2;
+
+  const n = REDUCED ? 4 : Math.round(6 + ev.vel * 14);
+  for (let i = 0; i < n; i++){
+    const p = parts[partHead = (partHead + 1) % MAXP];
+    const spread = rr(-0.55, 0.55);
+    const sp = rr(0.4, 2.4) * (0.5 + ev.vel);
+    p.a = true;
+    p.x = key.x + key.nx * rr(0, 8);
+    p.y = key.y + key.ny * rr(0, 8);
+    p.vx = (key.nx * Math.cos(spread) - key.ny * Math.sin(spread)) * sp;
+    p.vy = (key.ny * Math.cos(spread) + key.nx * Math.sin(spread)) * sp;
+    p.l = 0; p.ml = rr(0.9, 2.6); p.r = rr(0.6, 2.4);
+    p.h = col.h + rr(-14, 14); p.s = col.s; p.b = 0.5 + ev.vel * 0.6;
+  }
+
+  if (ev.voice === 'sub') FX.bassShock = Math.max(FX.bassShock, ev.vel);
+  FX.pulse = Math.max(FX.pulse, ev.vel * (ev.voice === 'sub' ? 1 : 0.55));
+}
+
+function spawnSigil(n, tension){
+  const g = sigils[sigilHead = (sigilHead + 1) % MAXSG];
+  // {5/2} is a pentagram and reads as a cheap occult decal; {7/3} and up read as
+  // a rune circle, which is what dark fantasy actually looks like.
+  const span = Math.min(stage.w, stage.h);
+  g.a = true; g.n = clamp(n + 2, 7, 13); g.r = span * 0.06;
+  g.mr = span * rr(0.30, 0.40); g.rot = rnd() * TAU;
+  g.l = 0; g.ml = (60 / M.bpm) * 8;             // two bars
+  g.h = tension ? 348 : (M.phaseIdx === 3 ? 45 : M.phaseIdx === 2 ? 268 : 186);
+}
+
+function spawnSilhouette(kind){
+  if (silhouettes.length > 1) return;   // two shapes in the murk is atmosphere; three is traffic
+  const dir = chance(0.5) ? 1 : -1;
+  silhouettes.push({
+    kind: kind || pick(SIL_KINDS),
+    x: dir > 0 ? -0.35 : 1.35, dir,
+    y: rr(0.22, 0.52), sc: rr(0.8, 1.5), sp: rr(0.018, 0.042), t: 0
+  });
+}
+
+function spawnConstellation(){
+  const cx = stage.w * 0.5, cy = stage.h * 0.34;
+  const n = REDUCED ? 60 : 180;
+  for (let i = 0; i < n; i++){
+    const p = parts[partHead = (partHead + 1) % MAXP];
+    const a = (i / n) * TAU * 3 + rnd();
+    const rad = stage.h * (0.10 + (i / n) * 0.26);
+    p.a = true;
+    p.x = cx + Math.cos(a) * rad * 1.5;
+    p.y = cy + Math.sin(a) * rad;
+    p.vx = Math.cos(a) * 0.12; p.vy = Math.sin(a) * 0.12 - 0.1;
+    p.l = 0; p.ml = rr(3, 6); p.r = rr(0.7, 2);
+    p.h = 45 + rr(-10, 22); p.s = 92; p.b = rr(0.5, 1);
+  }
+}
+
+/* ——————————————————————————————————————————————————————————————————————————
+   RENDER
+   —————————————————————————————————————————————————————————————————————————— */
+let lastGradKey = '';
+
+/* Both of these are full-screen fills, and evaluating a gradient across a million
+   pixels every frame is the most expensive thing in the renderer. Bake them into
+   bitmaps once per resize / phase change and blit instead. */
+function makeGradients(){
+  const key = stage.w + 'x' + stage.h + ':' + M.phaseIdx;
+  if (key === lastGradKey) return;
+  lastGradKey = key;
+  const H = stage.h, W = stage.w;
+  bgC.width = vigC.width = W; bgC.height = vigC.height = H;
+  const bg = bgC.getContext('2d'), vg = vigC.getContext('2d');
+  const bgGrad = bg.createLinearGradient(0, 0, 0, H);
+  const pi = M.phaseIdx;
+  if (pi === 2){
+    bgGrad.addColorStop(0,   '#07061f');
+    bgGrad.addColorStop(0.52,'#120b33');
+    bgGrad.addColorStop(1,   '#03030e');
+  } else if (pi === 3){
+    bgGrad.addColorStop(0,   '#071c2a');
+    bgGrad.addColorStop(0.5, '#07313a');
+    bgGrad.addColorStop(1,   '#030a12');
+  } else {
+    bgGrad.addColorStop(0,   '#04060f');
+    bgGrad.addColorStop(0.55,'#062b33');
+    bgGrad.addColorStop(1,   '#020509');
+  }
+  bg.fillStyle = bgGrad; bg.fillRect(0, 0, W, H);
+
+  const vignette = vg.createRadialGradient(W/2, H*0.52, H*0.18, W/2, H*0.52, H*0.92);
+  vignette.addColorStop(0, 'rgba(0,0,0,0)');
+  vignette.addColorStop(0.62,'rgba(0,0,0,0.34)');
+  vignette.addColorStop(1, 'rgba(0,0,0,0.88)');
+  vg.clearRect(0, 0, W, H);
+  vg.fillStyle = vignette; vg.fillRect(0, 0, W, H);
+}
+
+let introT = 0, clockT = 0, fpsAcc = 0, fpsN = 0, fps = 60;
+
+function render(dt){
+  const W = stage.w, H = stage.h;
+  clockT += dt;
+  if (M.started) introT = Math.min(1, introT + dt / 20);
+
+  makeGradients();
+
+  // ——— drain the note queue: audio and light land on the same frame ———
+  if (Audio.ready){
+    const now = Audio.ctx.currentTime;
+    while (visualQueue.length && visualQueue[0].time <= now){
+      spawnNote(visualQueue.shift());
+    }
+  }
+  if (FX.sigilQueue && Audio.ready && Audio.ctx.currentTime >= FX.sigilQueue.at){
+    spawnSigil(FX.sigilQueue.n, FX.sigilQueue.tension);
+    FX.sigilQueue = null;
+  }
+  if (FX.leviathanQ){ FX.leviathanQ = 0; spawnSilhouette('leviathan'); }
+  if (FX.silQueue){ spawnSilhouette(FX.silQueue); FX.silQueue = null; }
+  if (FX.constellation){ FX.constellation = 0; spawnConstellation(); }
+
+  // ——— letterbox ———
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, VW, VH);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(stage.x, stage.y, W, H); ctx.clip();
+  ctx.translate(stage.x, stage.y);
+
+  ctx.drawImage(bgC, 0, 0);
+
+  // ——— camera: locked to the musical cycle so the 90s loop seams perfectly ———
+  const cp = cyclePos();
+  const drift = REDUCED ? 0.25 : 1;
+  // The descent: you start high above the trench, the instrument a small light far
+  // below, and you fall toward it. Starting zoomed IN just showed a big dark arc.
+  const dive = easeOutCubic(introT);
+  const camS = (1 + Math.sin(cp * TAU) * 0.020 * drift) * lerp(0.52, 1, dive);
+  const camX = Math.sin(cp * TAU * 2) * W * 0.012 * drift;
+  const camY = Math.sin(cp * TAU) * H * 0.018 * drift + lerp(H * 0.30, 0, dive);
+  const shake = REDUCED ? 0 : FX.bassShock * 5;
+
+  glow.setTransform(1,0,0,1,0,0);
+  glow.clearRect(0, 0, glowC.width, glowC.height);
+  glow.save();
+  glow.scale(glowC.width / W, glowC.height / H);
+  glow.translate(W/2 + camX, H/2 + camY);
+  glow.scale(camS, camS);
+  glow.translate(-W/2, -H/2);
+
+  ctx.save();
+  ctx.translate(W/2 + camX + rr(-shake, shake), H/2 + camY + rr(-shake, shake));
+  ctx.scale(camS, camS);
+  ctx.translate(-W/2, -H/2);
+
+  drawGodRays(W, H, cp);
+  drawCaustics(W, H);
+  drawSnow(W, H, dt);
+  drawSilhouettes(W, H, dt);
+  drawSigils(dt);
+  drawColumns(dt);
+  drawKeyboard(dt);
+  drawShocks(dt);
+  drawParticles(dt);
+
+  ctx.restore();
+  glow.restore();
+
+  // ——— bloom: a two-step downscale, then one upscale back.
+  //     the bilinear filtering IS the blur, and it costs a third of ctx.filter. ———
+  const mc = midC.getContext('2d'), bc = bloomC.getContext('2d');
+  mc.clearRect(0, 0, midC.width, midC.height);
+  mc.drawImage(glowC, 0, 0, midC.width, midC.height);
+  bc.clearRect(0, 0, bloomC.width, bloomC.height);
+  bc.drawImage(midC, 0, 0, bloomC.width, bloomC.height);
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.78;
+  ctx.drawImage(bloomC, 0, 0, W, H);          // wide soft halo
+  ctx.globalAlpha = 0.62;
+  ctx.drawImage(glowC, 0, 0, W, H);           // tighter core
+  // ——— chromatic aberration on the downbeat: real channel separation, done by
+  //     masking two solid tints with the bloom at 1/16 res. ———
+  const ab = REDUCED ? 0 : FX.pulse * 9;
+  if (ab > 0.6){
+    tintBloom(abRC, '#ff2f4d');
+    tintBloom(abBC, '#3ad8ff');
+    ctx.globalAlpha = 0.30;
+    ctx.drawImage(abRC, -ab, 0, W, H);
+    ctx.drawImage(abBC,  ab, 0, W, H);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // ——— whiteout ———
+  if (FX.whiteout > 0.002){
+    ctx.fillStyle = 'rgba(214,244,255,' + (FX.whiteout * 0.92).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+    FX.whiteout *= Math.pow(0.02, dt);
+  }
+
+  ctx.drawImage(vigC, 0, 0);
+
+  if (!REDUCED){
+    ctx.save();
+    ctx.globalAlpha = 0.05 + FX.pulse * 0.02;
+    const ox = -ri(0, 511), oy = -ri(0, 511);
+    for (let x = ox; x < W; x += 512) for (let y = oy; y < H; y += 512) ctx.drawImage(grainC, x, y);
+    ctx.restore();
+  }
+
+  // depth haze, thickest at the top of the dive — it has to clear early enough
+  // that the first few seconds are worth looking at
+  if (introT < 1){
+    const a = Math.pow(1 - dive, 1.8);
+    ctx.fillStyle = 'rgba(2,5,12,' + (a * 0.80).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  ctx.restore();
+
+  FX.pulse     *= Math.pow(0.015, dt);
+  FX.bassShock *= Math.pow(0.004, dt);
+}
+
+/** paint a solid colour, then keep only where the bloom is bright */
+function tintBloom(target, colour){
+  const g = target.getContext('2d');
+  g.globalCompositeOperation = 'source-over';
+  g.clearRect(0, 0, target.width, target.height);
+  g.fillStyle = colour;
+  g.fillRect(0, 0, target.width, target.height);
+  g.globalCompositeOperation = 'destination-in';
+  g.drawImage(bloomC, 0, 0);
+  g.globalCompositeOperation = 'source-over';
+}
+
+/* ——— layer 1: god rays from far above, barely there ——— */
+function drawGodRays(W, H, cp){
+  const ox = W * 0.5, oy = -H * 0.55;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  // the light from the surface is strongest while you are still near it
+  const dive = 1 + (1 - introT) * 1.6;
+  const base = cp * TAU * 0.12;
+  for (let i = 0; i < 7; i++){
+    const a = -Math.PI/2 + Math.sin(base + i * 1.1) * 0.42 + (i - 3) * 0.14;
+    const wdt = 0.028 + Math.abs(Math.sin(base * 2 + i)) * 0.03;
+    const g = ctx.createLinearGradient(ox, oy, ox + Math.cos(a) * H * 2, oy + Math.sin(a) * H * 2);
+    const tint = M.phaseIdx === 3 ? '255,222,160' : M.phaseIdx === 2 ? '150,120,255' : '120,235,225';
+    g.addColorStop(0, 'rgba(' + tint + ',' + (0.17 * dive).toFixed(3) + ')');
+    g.addColorStop(1, 'rgba(' + tint + ',0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(ox + Math.cos(a - wdt) * H * 2.2, oy + Math.sin(a - wdt) * H * 2.2);
+    ctx.lineTo(ox + Math.cos(a + wdt) * H * 2.2, oy + Math.sin(a + wdt) * H * 2.2);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* ——— layer 2: caustics on the floor ——— */
+function drawCaustics(W, H){
+  const rows = REDUCED ? 8 : LOW ? 10 : 20;
+  const tint = M.phaseIdx === 3 ? 'rgba(255,226,170,' : M.phaseIdx === 2 ? 'rgba(150,124,255,' : 'rgba(110,230,220,';
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineWidth = 1.2;
+  for (let r = 0; r < rows; r++){
+    const y0 = H * 0.60 + (r / rows) * H * 0.46;
+    const amp = (6 + r * 1.4) * (1 - r / (rows * 2));
+    ctx.strokeStyle = tint + (0.060 + 0.045 * Math.sin(clockT * 0.6 + r)).toFixed(3) + ')';
+    ctx.beginPath();
+    for (let i = 0; i <= 18; i++){
+      const x = (i / 18) * W;
+      const y = y0 + Math.sin(i * 0.7 + clockT * 0.55 + r * 0.9) * amp
+                  + Math.sin(i * 1.9 - clockT * 0.31 + r) * amp * 0.4;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ——— layer 3: marine snow, three parallax bands ——— */
+function drawSnow(W, H, dt){
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < snow.length; i++){
+    const s = snow[i];
+    const par = 0.35 + s.z * 0.42;
+    s.y -= dt * s.sp * par * 0.06;
+    s.p += dt * 0.5;
+    if (s.y < -0.05){ s.y = 1.05; s.x = rnd(); }
+    const x = ((s.x + Math.sin(s.p) * 0.004) % 1) * W;
+    const y = s.y * H;
+    const r = s.r * par;
+    const a = (0.10 + s.z * 0.16) * (0.6 + 0.4 * Math.sin(s.p * 1.7));
+    ctx.fillStyle = 'rgba(180,238,255,' + a.toFixed(3) + ')';
+    ctx.fillRect(x, y, r, r);
+    if (s.z === 2){ glow.fillStyle = 'rgba(150,230,255,0.20)'; glow.fillRect(x - r, y - r, r * 3, r * 3); }
+  }
+  ctx.restore();
+}
+
+/* ——— layer 4: things in the murk, never fully revealed ———
+   The rule here is restraint: at full opacity with a rim light these read as props.
+   They have to sit only a shade off the water, and dissolve at the edges. */
+function drawSilhouettes(W, H, dt){
+  for (let i = silhouettes.length - 1; i >= 0; i--){
+    const s = silhouettes[i];
+    s.t += dt;
+    s.x += s.dir * s.sp * dt * 1.5;                    // ~30-60s to cross
+    if ((s.dir > 0 && s.x > 1.45) || (s.dir < 0 && s.x < -0.45)){ silhouettes.splice(i, 1); continue; }
+    // fade in and out at the edges of frame so nothing ever pops
+    const edge = clamp(Math.min(s.x + 0.35, 1.35 - s.x) / 0.35, 0, 1);
+    const x = s.x * W, y = s.y * H, sc = s.sc * H / 1100;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(s.dir * sc, sc);
+    // three passes at slightly different scales: a cheap way to soften the edge
+    for (let pass = 0; pass < 3; pass++){
+      const k = 1 + pass * 0.035;
+      ctx.save(); ctx.scale(k, k);
+      ctx.fillStyle = 'rgba(2,5,13,' + (0.15 * edge).toFixed(3) + ')';
+      ctx.beginPath();
+      if (s.kind === 'leviathan'){
+        const spine = k2 => Math.sin(k2 * 0.0038 + s.t * 0.42) * 52;
+        const girth = k2 => 46 * Math.pow(Math.max(0, 1 - (k2 / 720) * (k2 / 720)), 0.55);
+        ctx.moveTo(-720, spine(-720));
+        for (let q = -720; q <= 720; q += 30) ctx.lineTo(q, spine(q) - girth(q) * 0.55);
+        for (let q = 720; q >= -720; q -= 30) ctx.lineTo(q, spine(q) + girth(q));
+      } else if (s.kind === 'arch'){
+        ctx.moveTo(-210, 430); ctx.lineTo(-210, -60);
+        ctx.quadraticCurveTo(0, -430, 210, -60);
+        ctx.lineTo(210, 430); ctx.lineTo(138, 430); ctx.lineTo(138, -30);
+        ctx.quadraticCurveTo(0, -326, -138, -30);
+        ctx.lineTo(-138, 430);
+      } else {
+        ctx.moveTo(-70, 530); ctx.lineTo(-54, -360); ctx.lineTo(-8, -434);
+        ctx.lineTo(42, -332); ctx.lineTo(66, 530);
+      }
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    if (s.kind === 'leviathan'){
+      // dorsal spines, barely there — enough to say "alive", not enough to identify
+      ctx.strokeStyle = 'rgba(2,5,13,' + (0.22 * edge).toFixed(3) + ')';
+      ctx.lineWidth = 7;
+      ctx.beginPath();
+      for (let q = -560; q <= 560; q += 94){
+        const yy = Math.sin(q * 0.0038 + s.t * 0.42) * 52;
+        const g = 46 * Math.pow(Math.max(0, 1 - (q / 720) * (q / 720)), 0.55);
+        ctx.moveTo(q, yy - g * 0.5); ctx.lineTo(q + 10, yy - g * 1.5);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+/* ——— the sigil rings drawn on every chord change ——— */
+function drawSigils(dt){
+  for (let i = 0; i < MAXSG; i++){
+    const g = sigils[i]; if (!g.a) continue;
+    g.l += dt; g.rot += dt * 0.22;
+    if (g.l >= g.ml){ g.a = false; continue; }
+    const t = g.l / g.ml;
+    const r = lerp(g.r, g.mr, easeOutCubic(Math.min(1, t * 2.2)));
+    const a = Math.sin(Math.min(1, t) * Math.PI) * 0.30;
+    const cx = stage.w * 0.5, cy = stage.h * 0.34;
+    const n = g.n, skip = 3;
+    const squash = 0.62;
+    const col = (alpha, light) => 'hsla(' + g.h.toFixed(0) + ',70%,' + light + '%,' + alpha.toFixed(3) + ')';
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineWidth = 1;
+
+    // the ring architecture: two rails and a set of ticks between them
+    ctx.strokeStyle = col(a * 0.85, 72);
+    ctx.beginPath(); ctx.ellipse(cx, cy, r, r * squash, 0, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = col(a * 0.40, 66);
+    ctx.beginPath(); ctx.ellipse(cx, cy, r * 0.88, r * 0.88 * squash, 0, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = col(a * 0.55, 74);
+    ctx.beginPath();
+    for (let k = 0; k < n * 2; k++){
+      const ang = g.rot + (k / (n * 2)) * TAU;
+      const c = Math.cos(ang), sn = Math.sin(ang) * squash;
+      ctx.moveTo(cx + c * r * 0.9, cy + sn * r * 0.9);
+      ctx.lineTo(cx + c * r * (k % 2 ? 0.96 : 1.02), cy + sn * r * (k % 2 ? 0.96 : 1.02));
+    }
+    ctx.stroke();
+
+    // the star polygon draws itself, one chord at a time, over the first beat
+    const drawn = Math.min(n, Math.ceil(easeOutCubic(Math.min(1, t * 5)) * n));
+    ctx.strokeStyle = col(a * 0.34, 70);
+    ctx.beginPath();
+    for (let k = 0; k <= drawn; k++){
+      const ang = g.rot + (k * skip / n) * TAU;
+      const px = cx + Math.cos(ang) * r * 0.86, py = cy + Math.sin(ang) * r * 0.86 * squash;
+      k ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    }
+    ctx.stroke();
+    ctx.restore();
+    glow.strokeStyle = 'hsla(' + g.h.toFixed(0) + ',80%,64%,' + (a * 0.5).toFixed(3) + ')';
+    glow.lineWidth = 3;
+    glow.beginPath(); glow.ellipse(cx, cy, r, r * 0.62, 0, 0, TAU); glow.stroke();
+  }
+}
+
+/* ——— notes rise from the keys as columns of light, like plankton ——— */
+function drawColumns(dt){
+  for (let i = 0; i < MAXC; i++){
+    const c = cols[i]; if (!c.a) continue;
+    c.l += dt;
+    if (c.l >= c.ml){ c.a = false; continue; }
+    const t = c.l / c.ml;
+    const key = keys[c.k];
+    const rise = easeOutCubic(Math.min(1, t * 1.9));
+    const fade = Math.pow(1 - t, 1.6);
+    const h = c.hgt * rise;
+    const w = Math.max(1.4, stage.keyW * (0.42 + c.vel * 0.7));
+    const x0 = key.x + key.nx * 4,  y0 = key.y + key.ny * 4;
+    const x1 = key.x + key.nx * (4 + h), y1 = key.y + key.ny * (4 + h);
+    const g = ctx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, 'hsla(' + c.h.toFixed(0) + ',' + c.s + '%,62%,' + (0.50 * fade).toFixed(3) + ')');
+    g.addColorStop(0.35,'hsla(' + c.h.toFixed(0) + ',' + c.s + '%,56%,' + (0.26 * fade).toFixed(3) + ')');
+    g.addColorStop(1, 'hsla(' + c.h.toFixed(0) + ',' + c.s + '%,58%,0)');
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = g; ctx.lineWidth = w; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    ctx.restore();
+    // the leading head: the eye tracks this, and it's what makes the column read
+    // as light travelling rather than a bar that got taller
+    const hb = Math.pow(1 - t, 2.4) * (0.34 + c.vel * 0.34);
+    if (hb > 0.02){
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = 'hsla(' + c.h.toFixed(0) + ',' + c.s + '%,78%,' + hb.toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(x1, y1, w * 0.28, 0, TAU); ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+      glow.fillStyle = 'hsla(' + c.h.toFixed(0) + ',' + c.s + '%,72%,' + (hb * 0.45).toFixed(3) + ')';
+      glow.beginPath(); glow.arc(x1, y1, w * 1.4, 0, TAU); glow.fill();
+    }
+    glow.strokeStyle = 'hsla(' + c.h.toFixed(0) + ',' + c.s + '%,66%,' + (0.5 * fade).toFixed(3) + ')';
+    glow.lineWidth = w * 1.8; glow.lineCap = 'round';
+    glow.beginPath(); glow.moveTo(x0, y0); glow.lineTo(x1, y1); glow.stroke();
+  }
+}
+
+/* ——— the instrument itself: thin luminous glass slats bent into an arc ———
+   Keys have to be much longer than they are wide, and the divisions between them
+   have to be hairlines. Equal-length slats with wide gaps read as a railway. */
+function drawKeyboard(dt){
+  const inner = stage.R - stage.h * 0.050;
+  const outer = stage.R + stage.h * 0.014;
+  const a0 = keys[0].ang - stage.keyW / stage.R * 0.5;
+  const a1 = keys[KEY_N - 1].ang + stage.keyW / stage.R * 0.5;
+  ctx.save();
+  ctx.lineCap = 'butt';
+
+  // 1 — the key bed, one continuous pane of dark glass, fading out at both ends
+  //     so the instrument dissolves into the murk instead of stopping dead
+  const SEG = 26;
+  for (let i = 0; i < SEG; i++){
+    const f0 = i / SEG, f1 = (i + 1) / SEG + 0.002;
+    const taper = Math.sin(Math.min(1, Math.min(f0, 1 - f0) * 3.4) * Math.PI / 2);
+    const s0 = a0 + (a1 - a0) * f0, s1 = a0 + (a1 - a0) * f1;
+    ctx.strokeStyle = 'rgba(116,198,214,' + (0.060 * taper).toFixed(3) + ')';
+    ctx.lineWidth = outer - inner;
+    ctx.beginPath(); ctx.arc(stage.cx, stage.cy, (inner + outer) / 2, s0, s1); ctx.stroke();
+    ctx.strokeStyle = 'rgba(150,224,236,' + (0.18 * taper).toFixed(3) + ')';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(stage.cx, stage.cy, outer, s0, s1); ctx.stroke();
+    ctx.strokeStyle = 'rgba(150,224,236,' + (0.08 * taper).toFixed(3) + ')';
+    ctx.beginPath(); ctx.arc(stage.cx, stage.cy, inner, s0, s1); ctx.stroke();
+  }
+
+  // 2 — accidentals: short, narrow, low-contrast. they divide, they don't notch.
+  ctx.strokeStyle = 'rgba(3,10,18,0.55)';
+  ctx.lineWidth = stage.keyW * 0.34;
+  ctx.beginPath();
+  for (let i = 0; i < KEY_N; i++){
+    const k = keys[i];
+    if ([1,3,6,8,10].indexOf(pc(k.midi)) < 0) continue;
+    ctx.moveTo(stage.cx + k.nx * inner, stage.cy + k.ny * inner);
+    const m = lerp(inner, outer, 0.62);
+    ctx.lineTo(stage.cx + k.nx * m, stage.cy + k.ny * m);
+  }
+  ctx.stroke();
+
+  // 3 — hairline divisions
+  ctx.strokeStyle = 'rgba(0,0,0,0.30)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < KEY_N; i++){
+    const k = keys[i];
+    if ([0,5].indexOf(pc(k.midi)) < 0) continue;               // E|F and B|C boundaries
+    const dx = Math.cos(k.ang - stage.keyW / stage.R * 0.5);
+    const dy = Math.sin(k.ang - stage.keyW / stage.R * 0.5);
+    ctx.moveTo(stage.cx + dx * inner, stage.cy + dy * inner);
+    ctx.lineTo(stage.cx + dx * outer, stage.cy + dy * outer);
+  }
+  ctx.stroke();
+
+  // 4 — struck keys light the full depth of the slat
+  for (let i = 0; i < KEY_N; i++){
+    const k = keys[i];
+    k.glow = Math.max(0, k.glow - dt * 1.9);
+    const lit = k.glow;
+    if (lit <= 0.01) continue;
+    const isBlack = [1,3,6,8,10].indexOf(pc(k.midi)) >= 0;
+    const x0 = stage.cx + k.nx * inner, y0 = stage.cy + k.ny * inner;
+    const x1 = stage.cx + k.nx * outer, y1 = stage.cy + k.ny * outer;
+    ctx.strokeStyle = 'hsla(' + k.hue.toFixed(0) + ',' + k.sat + '%,' +
+                      (56 + lit * 32).toFixed(0) + '%,' + Math.min(0.95, 0.3 + lit * 0.8).toFixed(3) + ')';
+    ctx.lineWidth = stage.keyW * (isBlack ? 0.42 : 0.92);
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+
+    glow.strokeStyle = 'hsla(' + k.hue.toFixed(0) + ',' + k.sat + '%,68%,' + (lit * 0.8).toFixed(3) + ')';
+    glow.lineWidth = stage.keyW * 2.2;
+    glow.beginPath(); glow.moveTo(x0, y0); glow.lineTo(x1, y1); glow.stroke();
+    // a pool of light spilling along the bed around the struck key
+    glow.fillStyle = 'hsla(' + k.hue.toFixed(0) + ',' + k.sat + '%,64%,' + (lit * 0.26).toFixed(3) + ')';
+    const pr = stage.h * 0.034 * lit;
+    glow.beginPath(); glow.ellipse(k.x, k.y, pr * 1.7, pr, 0, 0, TAU); glow.fill();
+  }
+  ctx.restore();
+}
+
+/* ——— radial shockwaves on the plane ——— */
+function drawShocks(dt){
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < MAXS; i++){
+    const s = shocks[i]; if (!s.a) continue;
+    s.l += dt;
+    if (s.l >= s.ml){ s.a = false; continue; }
+    const t = s.l / s.ml;
+    const r = lerp(4, s.mr, easeOutCubic(t));
+    const a = Math.pow(1 - t, 2) * 0.5;
+    ctx.strokeStyle = 'hsla(' + s.h.toFixed(0) + ',82%,72%,' + a.toFixed(3) + ')';
+    ctx.lineWidth = s.w * (1 - t * 0.7);
+    ctx.beginPath(); ctx.ellipse(s.x, s.y, r, r * 0.4, 0, 0, TAU); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ——— bioluminescent particles: drag + buoyancy ——— */
+function drawParticles(dt){
+  const buoy = -14;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < MAXP; i++){
+    const p = parts[i]; if (!p.a) continue;
+    p.l += dt;
+    if (p.l >= p.ml){ p.a = false; continue; }
+    const drag = Math.pow(0.28, dt);
+    p.vx *= drag; p.vy = p.vy * drag + buoy * dt;
+    p.x += p.vx * 60 * dt; p.y += p.vy * 60 * dt;
+    const a = Math.pow(1 - p.l / p.ml, 1.5) * p.b;
+    ctx.fillStyle = 'hsla(' + p.h.toFixed(0) + ',' + p.s + '%,76%,' + a.toFixed(3) + ')';
+    ctx.fillRect(p.x - p.r * 0.5, p.y - p.r * 0.5, p.r, p.r);
+    glow.fillStyle = 'hsla(' + p.h.toFixed(0) + ',' + p.s + '%,70%,' + (a * 0.55).toFixed(3) + ')';
+    glow.fillRect(p.x - p.r * 1.6, p.y - p.r * 1.6, p.r * 3.2, p.r * 3.2);
+  }
+  ctx.restore();
+}
+
+/* ——————————————————————————————————————————————————————————————————————————
+   APP — input, chrome, loop
+   —————————————————————————————————————————————————————————————————————————— */
+const el = {
+  gate:  document.getElementById('gate'),
+  ui:    document.getElementById('ui'),
+  phase: document.getElementById('phase'),
+  meta:  document.getElementById('meta'),
+  rare:  document.getElementById('rare'),
+  keys:  document.getElementById('keys')
+};
+let rareTimer = null;
+function showRare(kind){
+  el.rare.textContent = '◈ ' + kind.toUpperCase();
+  el.rare.classList.add('on');
+  clearTimeout(rareTimer);
+  rareTimer = setTimeout(() => el.rare.classList.remove('on'), 4200);
+}
+
+let metaAcc = 0;
+function updateChrome(dt){
+  metaAcc += dt;
+  if (metaAcc < 0.25) return;
+  metaAcc = 0;
+  const bar = barOf(M.step) % CYCLE_BARS;
+  el.phase.innerHTML = '<b>' + M.phase.name + '</b><i>' + String(bar + 1).padStart(2,'0') + '/' + CYCLE_BARS + '</i>';
+  el.meta.innerHTML =
+    'seed ' + SEED + '<br>' +
+    M.bpm + ' bpm · ' + Math.round(M.swing * 100) + '% swing<br>' +
+    (M.muted ? 'muted' : M.paused ? 'paused' : Math.round(fps) + ' fps');
+}
+
+function start(){
+  if (M.started) return;
+  M.started = true;
+  buildAudio();
+  setDelayTime(M.bpm);
+  applyPhaseMix(Audio.ctx.currentTime);
+  M.nextTime = Audio.ctx.currentTime + 0.15;
+  Audio.master.gain.setValueAtTime(0.0001, Audio.ctx.currentTime);
+  Audio.master.gain.exponentialRampToValueAtTime(0.85, Audio.ctx.currentTime + 6);
+  Audio.padGain.gain.setTargetAtTime(M.phase.pad, Audio.ctx.currentTime, 3);
+  schedTimer = setInterval(schedulerTick, 25);
+  el.gate.classList.add('gone');
+  setTimeout(() => { el.gate.style.display = 'none'; }, 1700);
+}
+
+function reseed(){
+  SEED = (Math.random() * 0xFFFFFF | 0).toString(36).toUpperCase().padStart(4,'0');
+  rng = mulberry32(seedFromString(SEED));
+  const u = new URL(location.href); u.searchParams.set('seed', SEED);
+  history.replaceState(null, '', u);
+  M.voicing = []; M.pool = []; M.degree = 0; M.walkPos = 0;
+  silhouettes.length = 0;
+  for (const p of parts) p.a = false;
+  for (const c of cols) c.a = false;
+  for (const s of shocks) s.a = false;
+  for (const g of sigils) g.a = false;
+  visualQueue.length = 0;
+  if (Audio.ready) M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.05);
+}
+
+function jumpToPhase(i){
+  if (!Audio.ready) return;
+  const bar = barOf(M.step);
+  const cyc = Math.floor(bar / CYCLE_BARS);
+  // always jump forward — landing behind the cursor would replay the same bars
+  let target = cyc * CYCLE_BARS + PHASE_START[i];
+  if (target <= bar) target += CYCLE_BARS;
+  M.step = target * 16;
+  M.phaseIdx = i; M.phase = PHASES[i];
+  applyPhaseMix(Audio.ctx.currentTime);
+  M.nextTime = Audio.ctx.currentTime + 0.05;
+}
+
+function setPaused(p){
+  M.paused = p;
+  if (!Audio.ready) return;
+  if (p) Audio.ctx.suspend();
+  else Audio.ctx.resume().then(() => { M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.08); });
+}
+
+el.gate.addEventListener('click', start);
+el.gate.addEventListener('touchstart', e => { e.preventDefault(); start(); }, { passive:false });
+
+addEventListener('keydown', e => {
+  const k = e.key;
+  if (k === ' '){ e.preventDefault(); if (!M.started) return start(); setPaused(!M.paused); }
+  else if (k === 'm' || k === 'M'){
+    M.muted = !M.muted;
+    if (Audio.ready) Audio.master.gain.setTargetAtTime(M.muted ? 0.0001 : 0.85, Audio.ctx.currentTime, 0.12);
+  }
+  else if (k === 'r' || k === 'R') reseed();
+  else if (k >= '1' && k <= '4') jumpToPhase(+k - 1);
+  else if (k === 'ArrowLeft')  { M.bpm = clamp(M.bpm - 4, 72, 132); setDelayTime(M.bpm); }
+  else if (k === 'ArrowRight') { M.bpm = clamp(M.bpm + 4, 72, 132); setDelayTime(M.bpm); }
+  else if (k === 'v' || k === 'V'){ ASPECT = ASPECT === 'wide' ? 'tall' : 'wide'; lastGradKey = ''; resize(); }
+  else if (k === 'f' || k === 'F'){
+    if (!document.fullscreenElement) (document.documentElement.requestFullscreen || (()=>{})).call(document.documentElement);
+    else if (document.exitFullscreen) document.exitFullscreen();
+  }
+  else if (k === 'h' || k === 'H') el.ui.classList.toggle('hidden');
+  else if (k === '?' || k === '/') el.keys.classList.toggle('on');
+  else if (k === 'Escape') el.keys.classList.remove('on');
+});
+el.keys.addEventListener('click', () => el.keys.classList.remove('on'));
+
+addEventListener('resize', resize);
+addEventListener('orientationchange', () => setTimeout(resize, 120));
+
+document.addEventListener('visibilitychange', () => {
+  if (!Audio.ready) return;
+  if (document.hidden) Audio.ctx.suspend();
+  else if (!M.paused) Audio.ctx.resume().then(() => {
+    M.nextTime = Math.max(M.nextTime, Audio.ctx.currentTime + 0.1);
+  });
+});
+
+/* ——— main loop ——— */
+let last = performance.now(), lowStreak = 0;
+function frame(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc > 0.5){ fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0;
+    // hysteresis, and it has to be able to climb back out — a single hitch used
+    // to latch the scene into reduced fidelity for the rest of the run
+    if (fps < 44){ lowStreak = Math.max(1, lowStreak + 1); if (lowStreak > 3 && !LOW){ LOW = true; resize(); } }
+    else if (fps > 56){ lowStreak = Math.min(-1, lowStreak - 1); if (lowStreak < -8 && LOW){ LOW = false; resize(); } }
+    else lowStreak = 0;
+  }
+  render(M.paused ? 0 : dt);
+  updateChrome(dt);
+  requestAnimationFrame(frame);
+}
+
+buildGrain();
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
